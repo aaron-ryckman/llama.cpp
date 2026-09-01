@@ -958,6 +958,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_pixtral>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_DSV4VL:
+            {
+                builder = std::make_unique<clip_graph_dsv4vl>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_DOTS_OCR:
         case PROJECTOR_TYPE_DOTS3NOTE_V: // same ViT + merger; pyramid MoE is handled by build_vit
             {
@@ -1509,6 +1513,25 @@ struct clip_model_loader {
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
                         hparams.set_warmup_n_tokens(16*16);
+                    } break;
+                case PROJECTOR_TYPE_DSV4VL:
+                    {
+                        hparams.n_merge = 3;
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        hparams.image_resize_pad = PAD_CEIL;
+                        hparams.image_pad_color = {127, 127, 127};
+                        hparams.rope_theta = 10000.0f;
+                        hparams.ffn_op = FFN_SILU;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels, false);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
+                        if (hparams.image_min_pixels <= 0) {
+                            hparams.image_min_pixels = 147456;
+                        }
+                        if (hparams.image_max_pixels <= 0) {
+                            hparams.image_max_pixels = 768 * 768;
+                        }
+                        hparams.set_warmup_n_tokens(64);
                     } break;
                 case PROJECTOR_TYPE_PIXTRAL:
                     {
@@ -2713,6 +2736,17 @@ struct clip_model_loader {
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
                     model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_DSV4VL:
+                {
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.mm_img_begin  = get_tensor(TN_IMAGE_START);
+                    model.mm_img_end    = get_tensor(TN_IMAGE_END);
+                    model.image_newline = get_tensor(TN_IMAGE_NEWLINE);
+                    model.image_pad     = get_tensor(TN_IMAGE_PAD);
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
@@ -4164,6 +4198,19 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 // 3x stride-2 conv2d over mel frames
                 n_patches = (img->nx() + 7) / 8;
             } break;
+        case PROJECTOR_TYPE_DSV4VL:
+            {
+                const int merge = params.n_merge > 0 ? params.n_merge : 3;
+                const int n_vit_w = img->nx() / patch_size;
+                const int n_vit_h = img->ny() / patch_size;
+                const int n_llm_w = (n_vit_w + merge - 1) / merge;
+                const int n_llm_h = (n_vit_h + merge - 1) / merge;
+                const int pad_h = n_llm_h % 2;
+                const int rows = n_llm_h + pad_h;
+                const int row_len = n_llm_w + 1;
+                const int pad_last = ((rows / 2) * row_len % 2) * 2;
+                n_patches = 2 + rows * row_len + pad_last;
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
             {
@@ -5002,6 +5049,31 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 set_input_f32("mimovl_idx_col",       idx_col);
                 set_input_f32("mimovl_window_mask",   mask);
             } break;
+        case PROJECTOR_TYPE_DSV4VL:
+            {
+                const int rd = hparams.n_embd / hparams.n_head / 2;
+                const int nw = pos_w;
+                const int nh = pos_h;
+                const int npos = nw * nh;
+                const float theta = hparams.rope_theta > 0 ? hparams.rope_theta : 10000.0f;
+                std::vector<float> c(rd * npos), s(rd * npos);
+                for (int y = 0; y < nh; ++y) {
+                    for (int x = 0; x < nw; ++x) {
+                        const int i = y * nw + x;
+                        for (int k = 0; k < rd / 2; ++k) {
+                            const float inv = 1.0f / powf(theta, (float) (2 * k) / (float) rd);
+                            const float fh = (float) y * inv;
+                            const float fw = (float) x * inv;
+                            c[i * rd + k] = cosf(fh);
+                            s[i * rd + k] = sinf(fh);
+                            c[i * rd + rd / 2 + k] = cosf(fw);
+                            s[i * rd + rd / 2 + k] = sinf(fw);
+                        }
+                    }
+                }
+                set_input_f32("rope_cos", c);
+                set_input_f32("rope_sin", s);
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
@@ -5806,6 +5878,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_PHI4:
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
+        case PROJECTOR_TYPE_DSV4VL:
         case PROJECTOR_TYPE_DOTS_OCR:
         case PROJECTOR_TYPE_DOTS3NOTE_V:
         case PROJECTOR_TYPE_DOTS3NOTE_A:
