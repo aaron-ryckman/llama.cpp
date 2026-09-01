@@ -163,6 +163,18 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, 0);
             layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, 0);
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, 0);
+        } else {
+            // Experiment (dreadnaught 2026-08-26): convert skipped the 51B n-gram
+            // table and omitted PLE KV, but left blk.1.ple_* in the GGUF. Strict
+            // done_getting_tensors then fails (expected 1223, got 1217). Consume
+            // leftovers as optional so a no-PLE smoke load can proceed.
+            // ple_conv_kernel is 0 when PLE KV is absent; official Flash-Next is 4.
+            create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, TENSOR_NOT_REQUIRED);
+            create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, TENSOR_NOT_REQUIRED);
+            create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, TENSOR_NOT_REQUIRED);
+            create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, TENSOR_NOT_REQUIRED);
+            create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, TENSOR_NOT_REQUIRED);
+            create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { 4, hc_dim }, TENSOR_NOT_REQUIRED);
         }
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
