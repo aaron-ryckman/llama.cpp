@@ -604,6 +604,7 @@ struct clip_model {
     ggml_tensor * mm_merger_fc2_b = nullptr;
 
     ggml_tensor * image_newline = nullptr;
+    ggml_tensor * image_pad = nullptr;
     ggml_tensor * view_seperator = nullptr;
 
 

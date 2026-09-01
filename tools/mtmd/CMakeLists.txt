@@ -51,6 +51,7 @@ add_library(mtmd
             models/minicpmv.cpp
             models/paddleocr.cpp
             models/pixtral.cpp
+            models/dsv4vl.cpp
             models/qwen2vl.cpp
             models/minimax-m3.cpp
             models/qwen3vl.cpp
@@ -160,4 +161,9 @@ if (LLAMA_BUILD_TOOLS)
     set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
     target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
     target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
+
+    add_executable(dump-dsv4vl-clip dump-dsv4vl-clip.cpp)
+    set_target_properties(dump-dsv4vl-clip PROPERTIES OUTPUT_NAME dump-dsv4vl-clip)
+    target_link_libraries(dump-dsv4vl-clip PRIVATE llama-common mtmd Threads::Threads)
+    target_compile_features(dump-dsv4vl-clip PRIVATE cxx_std_17)
 endif()

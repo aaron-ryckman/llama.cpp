@@ -750,6 +750,11 @@ struct mtmd_context {
                     sli_img_start_tmpl = "<fake_token_around_image><row_%d_col_%d>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_DSV4VL:
+                {
+                    // START/PAD/NEWLINE/END are packed into the projector output
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
                     // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
