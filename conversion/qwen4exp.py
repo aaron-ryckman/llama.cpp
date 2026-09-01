@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Iterable
 
 import torch
@@ -9,9 +10,11 @@ from torch import Tensor
 import gguf
 import numpy as np
 
-from .base import ModelBase, MmprojModel
+from .base import LazyTorchTensor, ModelBase, MmprojModel
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
+
+logger = logging.getLogger("hf-to-gguf")
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
@@ -26,9 +29,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # The MTP block is a separate draft head. It is skipped by default (as vLLM does), but
+    # `--mtp` exports it on its own as a draft model for speculative decoding. The mixin
+    # machinery arrives via _LinearAttentionVReorderBase -> Qwen3NextModel -> _QwenMtpMixin;
+    # these flags previously overrode it off.
+    supports_mtp_export = True
+    no_mtp = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -39,6 +45,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_rows_per_shard: int | None = None
         self._ple_map = None
         self._ple_path = None
+        # Official FP8 checkpoint stores the 128 PLE shards as float8_e4m3fn
+        # plus one scalar ngram_embedding.weight_scale (not per-shard
+        # weight_scale_inv). base.py's quant_method=="fp8" path only consumes
+        # *_scale_inv, so the scalar would hit map_tensor_name and abort.
+        self._ple_fp8_scale: Tensor | None = None
+        self._ple_fp8_scale_looked: bool = False
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -68,14 +80,28 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+        # the loader sizes this array by n_layer_all, which counts the MTP block. That block
+        # carries indexer tensors and is never recurrent, so it takes the full-attention ratio.
+        ratios += [ratio] * max(0, self.block_count - n_layer)
+        self.gguf_writer.add_attention_compress_ratios(ratios)
+
+        # The MTP block carries no PLE n-gram layers. Emitting the key group anyway would make
+        # the loader demand the PLE hparams -- and the per-layer input width -- for tensors that
+        # are not in an MTP-only file.
+        if self.mtp_only:
+            return
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
-        ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+        #
+        # Experiment (dreadnaught 8x MI50, 2026-08-26): skip the 51B n-gram
+        # table. Materialising it is a 191 GiB f32 mmap; the GGUF writer then
+        # copies it to convert to bf16 and climbs past 250 GiB RSS. The rest of
+        # qwen4exp (GDN + QSA + MoE) is what we need to prove on gfx906 first.
+        ple_layers: list[int] = []
         if not ple_layers:
+            logger.info("PLE: skipping n-gram table (ple_layer_ids=%s)", hp.get("ple_layer_ids"))
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
@@ -118,6 +144,18 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return int(eos[-1])
         return int(eos)
 
+    @classmethod
+    def filter_tensors(cls, item):
+        name = item[0]
+        if name.startswith("mtp.hyper_connection_mixer."):
+            if cls.no_mtp:
+                return None
+            # Remap and return *without* super(): mixin mtp_only keep-list would
+            # drop model.hyper_connection_mixer.*, but the draft file needs it
+            # (C++ loads hc_head_norm/down/up as required even for MTP-only).
+            return (name.replace("mtp.", "model.", 1), item[1])
+        return super().filter_tensors(item)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
         if name.endswith("ple_embedding.layer_multipliers"):
@@ -130,8 +168,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
             return []
 
+        # Drop the shared FP8 scale after we have used it in _write_ple_shard.
+        if name.endswith("ngram_embedding.weight_scale"):
+            return []
+
         if ".ngram_embedding.shard_" in name:
-            return self._place_ple_shard(data_torch, name)
+            return []  # skipped with PLE table; see set_gguf_parameters
 
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
@@ -165,6 +207,22 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     # The file holds float32 because that is what base.py has already cast the
     # shards to by the time modify_tensors sees them, and what it calls .numpy()
     # on afterwards.
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+        e_name, h_name = "mtp.fc_embedding.weight", "mtp.fc_hidden.weight"
+        have_e, have_h = e_name in self.model_tensors, h_name in self.model_tensors
+        if not have_e and not have_h:
+            return
+        if not have_e or not have_h:
+            raise KeyError(f"unpaired MTP input projection: need both {e_name} and {h_name}")
+        e = LazyTorchTensor.to_eager(self.model_tensors[e_name]())
+        h = LazyTorchTensor.to_eager(self.model_tensors[h_name]())
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ,
+                                       self.hparams["num_hidden_layers"]),
+               torch.cat([e, h], dim=1).contiguous())
+        del self.model_tensors[e_name]
+        del self.model_tensors[h_name]
 
     def _place_ple_shard(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
 
@@ -215,15 +273,37 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # is that exactly one shard is resident at a time
         from .base import LazyTorchTensor
 
-        eager = LazyTorchTensor.to_eager(shard).to(torch.float32).contiguous()
+        eager = LazyTorchTensor.to_eager(shard)
+        fp8_types = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if hasattr(torch, "float8_e4m3fnuz"):
+            fp8_types = fp8_types + (torch.float8_e4m3fnuz,)
+        if eager.dtype in fp8_types:
+            eager = eager.to(torch.float32)
+            scale = self._ple_fp8_scale_value()
+            if scale is not None:
+                eager = eager * scale
+        else:
+            eager = eager.to(torch.float32)
+        eager = eager.contiguous()
         self._ple_map[start:start + rows] = eager.numpy()
         del eager
+
+    def _ple_fp8_scale_value(self) -> Tensor | None:
+        """Scalar ngram_embedding.weight_scale from the official FP8 checkpoint."""
+        if self._ple_fp8_scale_looked:
+            return self._ple_fp8_scale
+        self._ple_fp8_scale_looked = True
+        for name, gen in self.model_tensors.items():
+            if name.endswith("ngram_embedding.weight_scale"):
+                t = gen().to(torch.float32).reshape(())
+                self._ple_fp8_scale = t
+                logger.info("PLE FP8: applying scalar ngram_embedding.weight_scale=%s", float(t))
+                return t
+        return None
 
     def _finish_ple_table(self, total_rows: int):
 
         self._ple_map.flush()
-        del self._ple_map
-        self._ple_map = None
 
         # trim the tail if the last shard came up short of a full stride
         want = total_rows * self._ple_row_dim * 4
@@ -231,9 +311,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             with open(self._ple_path, "r+b") as f:
                 f.truncate(want)
 
-        raw = np.memmap(self._ple_path, dtype=np.float32, mode="r+",
-                        shape=(total_rows, self._ple_row_dim))
-        return torch.from_numpy(np.asarray(raw))
+        # Keep a writable memmap VIEW. np.asarray(memmap) copies ~191 GiB into
+        # RAM and OOMs; torch.bfloat16().numpy() is also unsupported. The GGUF
+        # writer downcasts this f32 view to bf16 itself.
+        self._ple_map = np.memmap(self._ple_path, dtype=np.float32, mode="r+",
+                                  shape=(total_rows, self._ple_row_dim))
+        logger.info("PLE: wrapping %d x %d f32 mmap by view (no copy)",
+                    total_rows, self._ple_row_dim)
+        return torch.from_numpy(self._ple_map)
 
     def prepare_tensors(self):
         super().prepare_tensors()
