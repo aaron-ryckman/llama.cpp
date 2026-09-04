@@ -3662,12 +3662,19 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        int64_t dbg_t0 = 0, dbg_t1 = 0, dbg_t2 = 0;
         queue_tasks.yield_to_queue([&]() {
+            dbg_t0 = ggml_time_us();
             ret = llama_decode(ctx_tgt, batch_view);
+            dbg_t1 = ggml_time_us();
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            dbg_t2 = ggml_time_us();
         });
+        if (batch_view.n_tokens >= 128) {
+            SRV_INF("DEC_TRACE server: n_tokens=%d has_output=%d decode=%.1fms sync=%.1fms\n", (int) batch_view.n_tokens, (int) has_output, (dbg_t1-dbg_t0)/1000.0, (dbg_t2-dbg_t1)/1000.0);
+        }
 
         if (ret != 0) {
             {

@@ -725,7 +725,11 @@ void llama_context::synchronize() {
         return;
     }
 
+    const int64_t dbg_t_s0 = ggml_time_us();
     ggml_backend_sched_synchronize(sched.get());
+    if (cparams.embeddings_nextn && ggml_time_us() - dbg_t_s0 > 50000) {
+        LLAMA_LOG_INFO("DEC_TRACE sync: ctx_type=%d %.1fms\n", (int) cparams.ctx_type, (ggml_time_us()-dbg_t_s0)/1000.0);
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1799,6 +1803,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
+    int64_t dbg_t_proc = 0, dbg_t_extract = 0; int dbg_n_ub = 0; int64_t dbg_t_dec0 = ggml_time_us();
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
@@ -1833,7 +1838,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        const int64_t t_ub0 = ggml_time_us();
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const int64_t t_ub1 = ggml_time_us(); dbg_t_proc += t_ub1 - t_ub0;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1987,7 +1994,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        dbg_t_extract += ggml_time_us() - t_ub1; dbg_n_ub++;
     } while (mctx->next());
+    if (cparams.embeddings_nextn && n_tokens_all >= 128) {
+        LLAMA_LOG_INFO("DEC_TRACE decode: ctx_type=%d n_tokens=%d n_outputs=%d n_ub=%d proc=%.1fms extract=%.1fms total=%.1fms\n",
+            (int) cparams.ctx_type, (int) n_tokens_all, (int) n_outputs_all, dbg_n_ub, dbg_t_proc/1000.0, dbg_t_extract/1000.0, (ggml_time_us()-dbg_t_dec0)/1000.0);
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
