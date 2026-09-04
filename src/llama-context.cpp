@@ -20,6 +20,59 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <map>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+
+// --- GLM53_OP_PROFILE: per-op wall time via the sched eval callback (debug only) ---
+// The sched computes node-by-node and synchronizes the split backend after every node when a
+// callback is installed, so ask->done brackets exactly one op's compute. Gaps between done and
+// the next ask are the sched's own work (split input copies, allocation).
+struct dbg_op_prof {
+    int64_t t_ask = 0, t_done = 0;
+    long long n_nodes = 0;
+    std::map<std::string, std::pair<double, long long>> acc; // key -> (ms, count)
+};
+static dbg_op_prof g_dbg_prof;
+static bool dbg_prof_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    auto * p = (dbg_op_prof *) ud;
+    const int64_t now = ggml_time_us();
+    if (ask) {
+        if (p->t_done) {
+            auto & g = p->acc["__gap__ (sched: split input copies / alloc)"];
+            g.first += (now - p->t_done) / 1000.0; g.second++;
+        }
+        p->t_ask = now;
+        return true;
+    }
+    std::string name(t->name);
+    const size_t d = name.find_last_of('-');
+    if (d != std::string::npos && d + 1 < name.size()) {
+        bool dig = true;
+        for (size_t i = d + 1; i < name.size(); ++i) { if (!isdigit((unsigned char) name[i])) { dig = false; break; } }
+        if (dig) { name = name.substr(0, d); }
+    }
+    const std::string key = std::string(ggml_op_desc(t)) + "  " + name;
+    auto & e = p->acc[key];
+    e.first += (now - p->t_ask) / 1000.0; e.second++;
+    p->n_nodes++;
+    p->t_done = now;
+    return true;
+}
+static void dbg_prof_dump(const char * tag, int n_tokens) {
+    auto & p = g_dbg_prof;
+    std::vector<std::pair<std::string, std::pair<double, long long>>> v(p.acc.begin(), p.acc.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    double tot = 0; for (const auto & e : v) { tot += e.second.first; }
+    LLAMA_LOG_WARN("OP_PROF %s n_tokens=%d nodes=%lld total=%.0fms (top 24)\n", tag, n_tokens, p.n_nodes, tot);
+    int k = 0;
+    for (const auto & e : v) {
+        if (k++ >= 24) { break; }
+        LLAMA_LOG_WARN("OP_PROF   %8.1f ms %6lld x  %s\n", e.second.first, e.second.second, e.first.c_str());
+    }
+    p.acc.clear(); p.n_nodes = 0; p.t_done = 0;
+}
 
 //
 // llama_context
@@ -140,6 +193,11 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (getenv("GLM53_OP_PROFILE") && params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.cb_eval           = dbg_prof_cb;
+        cparams.cb_eval_user_data = &g_dbg_prof;
+        LLAMA_LOG_WARN("%s: GLM53_OP_PROFILE: per-op timing enabled (node-by-node, slow)\n", __func__);
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -2003,6 +2061,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (n_tokens_all >= 128) {
         LLAMA_LOG_WARN("DEC_TRACE decode: nextn=%d ctx_type=%d n_tokens=%d n_outputs=%d n_ub=%d proc=%.1fms extract=%.1fms total=%.1fms\n",
             (int) cparams.embeddings_nextn, (int) cparams.ctx_type, (int) n_tokens_all, (int) n_outputs_all, dbg_n_ub, dbg_t_proc/1000.0, dbg_t_extract/1000.0, (ggml_time_us()-dbg_t_dec0)/1000.0);
+        if (cparams.cb_eval == dbg_prof_cb) {
+            dbg_prof_dump(cparams.embeddings_nextn ? "nextn" : "normal", (int) n_tokens_all);
+        }
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
