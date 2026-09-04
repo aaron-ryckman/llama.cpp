@@ -670,6 +670,11 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     // unweighted mean, not DeepSeek-V4's learned gated head
+    static const bool dbg_cont_tail = getenv("GLM53_CONT_TAIL") != nullptr; // experiment: contiguous input for the unmasked tail
+    if (!mask_early && dbg_cont_tail) {
+        inpL = ggml_cont(ctx0, inpL);
+        cb(inpL, "l_last_cont", -1);
+    }
     cur = build_hc_mean(ctx0, inpL);
     cb(cur, "hc_mean", -1);
 
