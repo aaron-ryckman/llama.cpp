@@ -1522,10 +1522,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
+            const int64_t t_p0 = ggml_time_us();
+            llama_synchronize(ctx_tgt);
+            const int64_t t_p1 = ggml_time_us();
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
+            const int64_t t_p2 = ggml_time_us();
 
             // fill the pending embeddings from a previous run
             auto set_h = [&](int idx, const float * h_row) {
@@ -1567,6 +1571,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            const int64_t t_p3 = ggml_time_us();
+            llama_synchronize(ctx_dft);
+            const int64_t t_p4 = ggml_time_us();
+            SPC_INF("MTP_TRACE process: n_tokens=%d pos0=%d tgt_sync=%.1fms h_copy=%.1fms dft_decode=%.1fms dft_sync=%.1fms\n",
+                    (int) n_tokens, (int) batch_in.pos[0],
+                    (t_p1 - t_p0) / 1000.0, (t_p2 - t_p1) / 1000.0, (t_p3 - t_p2) / 1000.0, (t_p4 - t_p3) / 1000.0);
             if (!ok) {
                 return false;
             }
