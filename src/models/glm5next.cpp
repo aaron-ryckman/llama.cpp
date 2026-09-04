@@ -663,7 +663,16 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     static const bool dbg_force_mask_early = getenv("GLM53_FORCE_MASK_EARLY") != nullptr; // experiment: tail cost isolation
     const bool mask_early = dbg_force_mask_early || !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
 
-    if (inp_out_ids && mask_early) {
+    static const bool dbg_side_branch = getenv("GLM53_SIDE_BRANCH") != nullptr; // experiment/fix: h_nextn as a side branch, main path masked early
+    const bool side = !mask_early && dbg_side_branch;
+    if (side) {
+        ggml_tensor * h_full = build_hc_mean(ctx0, inpL);
+        h_full = build_norm(h_full, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(h_full, "h_nextn", -1);
+        res->t_h_nextn = h_full;
+    }
+    const bool mask_early2 = mask_early || side;
+    if (inp_out_ids && mask_early2) {
         // get_rows needs one token's streams contiguous
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
@@ -671,12 +680,12 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 
     // unweighted mean, not DeepSeek-V4's learned gated head
     static const bool dbg_cont_tail = getenv("GLM53_CONT_TAIL") != nullptr; // experiment: contiguous input for the unmasked tail
-    if (!mask_early && dbg_cont_tail) {
+    if (!mask_early2 && dbg_cont_tail) {
         inpL = ggml_cont(ctx0, inpL);
         cb(inpL, "l_last_cont", -1);
     }
     static const bool dbg_view_tail = getenv("GLM53_VIEW_TAIL") != nullptr; // experiment: no tail math (timing only, wrong h)
-    if (!mask_early && dbg_view_tail) {
+    if (!mask_early2 && dbg_view_tail) {
         cur = ggml_view_2d(ctx0, inpL, n_embd, inpL->ne[2], inpL->nb[2], 0);
         cb(cur, "tail_view", -1);
     } else {
@@ -685,10 +694,12 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     }
 
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+    if (!side) {
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+    }
 
-    if (inp_out_ids && !mask_early) {
+    if (inp_out_ids && !mask_early2) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
