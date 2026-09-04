@@ -669,6 +669,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_tensor * h_full = build_hc_mean(ctx0, inpL);
         h_full = build_norm(h_full, model.output_norm, nullptr, LLM_NORM_RMS, -1);
         cb(h_full, "h_nextn", -1);
+        ggml_build_forward_expand(gf, h_full); // side branch is not an ancestor of the logits
         res->t_h_nextn = h_full;
     }
     const bool mask_early2 = mask_early || side;
