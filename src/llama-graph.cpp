@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include <cstdlib>
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1367,7 +1368,8 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
     }
-    if (t_h_nextn != nullptr) {
+    static const bool dbg_no_nextn_output_flag = getenv("GLM53_NO_NEXTN_OUTPUT_FLAG") != nullptr; // experiment
+    if (t_h_nextn != nullptr && !dbg_no_nextn_output_flag) {
         ggml_set_output(t_h_nextn);
     }
     {
