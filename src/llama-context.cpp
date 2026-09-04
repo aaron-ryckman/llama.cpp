@@ -35,6 +35,8 @@ struct dbg_op_prof {
     std::map<std::string, std::pair<double, long long>> acc; // key -> (ms, count)
 };
 static dbg_op_prof g_dbg_prof;
+struct dbg_ub_phases { int64_t t_build = 0, t_alloc = 0, t_inputs = 0, t_compute = 0; int n_splits = 0; };
+static dbg_ub_phases g_dbg_ub;
 static bool dbg_prof_cb(struct ggml_tensor * t, bool ask, void * ud) {
     auto * p = (dbg_op_prof *) ud;
     const int64_t now = ggml_time_us();
@@ -1417,6 +1419,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    const int64_t dbg_u0 = ggml_time_us();
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1446,6 +1449,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        g_dbg_ub.t_build += ggml_time_us() - dbg_u0;
+        const int64_t dbg_u1 = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1458,12 +1463,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        g_dbg_ub.t_alloc += ggml_time_us() - dbg_u1;
+        g_dbg_ub.n_splits = ggml_backend_sched_get_n_splits(sched.get());
+        const int64_t dbg_u2 = ggml_time_us();
         res->set_inputs(&ubatch);
+        g_dbg_ub.t_inputs += ggml_time_us() - dbg_u2;
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t dbg_u3 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    g_dbg_ub.t_compute += ggml_time_us() - dbg_u3;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2061,6 +2072,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (n_tokens_all >= 128) {
         LLAMA_LOG_WARN("DEC_TRACE decode: nextn=%d ctx_type=%d n_tokens=%d n_outputs=%d n_ub=%d proc=%.1fms extract=%.1fms total=%.1fms\n",
             (int) cparams.embeddings_nextn, (int) cparams.ctx_type, (int) n_tokens_all, (int) n_outputs_all, dbg_n_ub, dbg_t_proc/1000.0, dbg_t_extract/1000.0, (ggml_time_us()-dbg_t_dec0)/1000.0);
+        LLAMA_LOG_WARN("DEC_TRACE phases: build=%.0fms alloc=%.0fms inputs=%.0fms compute_submit=%.0fms splits=%d reused_total=%d\n",
+            g_dbg_ub.t_build/1000.0, g_dbg_ub.t_alloc/1000.0, g_dbg_ub.t_inputs/1000.0, g_dbg_ub.t_compute/1000.0, g_dbg_ub.n_splits, (int) n_reused);
+        g_dbg_ub = dbg_ub_phases();
         if (cparams.cb_eval == dbg_prof_cb) {
             dbg_prof_dump(cparams.embeddings_nextn ? "nextn" : "normal", (int) n_tokens_all);
         }
