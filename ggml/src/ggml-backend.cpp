@@ -1606,6 +1606,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
+            {
+                struct ggml_tensor * nd = sched->graph.nodes[i];
+                const int pb = sched->prev_node_backend_ids[i], nb = sched->node_backend_ids[i];
+                GGML_LOG_WARN("SCHED_TRACE ids_changed at node %d/%d: %s '%s' [%lld,%lld,%lld] prev=%s new=%s (src0=%s on %s)\n", i, sched->graph.n_nodes,
+                    ggml_op_desc(nd), nd->name, (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2],
+                    pb >= 0 ? ggml_backend_name(sched->backends[pb]) : "?", nb >= 0 ? ggml_backend_name(sched->backends[nb]) : "?",
+                    nd->src[0] ? nd->src[0]->name : "-", (nd->src[0] && nd->src[0]->buffer) ? ggml_backend_buffer_name(nd->src[0]->buffer) : "?");
+            }
             break;
         }
     }
@@ -1614,6 +1622,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
                 sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
+                GGML_LOG_WARN("SCHED_TRACE ids_changed at LEAF %d/%d: '%s' prev=%s new=%s\n", i, sched->graph.n_leafs, sched->graph.leafs[i]->name,
+                    ggml_backend_name(sched->backends[sched->prev_leaf_backend_ids[i]]), ggml_backend_name(sched->backends[sched->leaf_backend_ids[i]]));
                 break;
             }
         }
@@ -1627,9 +1637,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         GGML_LOG_WARN("SCHED_TRACE alloc_splits: ids_check=%.0fms gallocr_alloc=%.0fms ok=%d ids_changed=%d\n", (dbg_s1-dbg_s0)/1000.0, (dbg_s2-dbg_s1)/1000.0, (int) dbg_ok, (int) backend_ids_changed);
     }
     if (!dbg_ok) {
-#ifndef NDEBUG
         GGML_LOG_WARN("SCHED_TRACE %s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
-#endif
 
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
