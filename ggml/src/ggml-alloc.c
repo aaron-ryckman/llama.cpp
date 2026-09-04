@@ -1009,14 +1009,14 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
+        GGML_LOG_WARN("ALLOC_TRACE " "%s: graph has different number of nodes\n", __func__);
 #endif
         return true;
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
+        GGML_LOG_WARN("ALLOC_TRACE " "%s: graph has different number of leafs\n", __func__);
 #endif
         return true;
     }
@@ -1027,7 +1027,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
+            GGML_LOG_WARN("ALLOC_TRACE " "%s: node %s is not valid\n", __func__, node->name);
 #endif
             return true;
         }
@@ -1039,7 +1039,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
+                GGML_LOG_WARN("ALLOC_TRACE " "%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
                 return true;
             }

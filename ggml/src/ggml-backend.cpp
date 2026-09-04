@@ -1621,7 +1621,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
+        GGML_LOG_WARN("SCHED_TRACE %s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
 
         if (sched->debug_realloc > 0) {
