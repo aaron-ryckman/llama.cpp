@@ -2846,6 +2846,7 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            if (getenv("GLM53_FORCE_NEXTN")) { llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false); }
         }
 
         llama_batch batch_view;

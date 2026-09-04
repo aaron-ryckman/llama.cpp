@@ -727,7 +727,7 @@ void llama_context::synchronize() {
 
     const int64_t dbg_t_s0 = ggml_time_us();
     ggml_backend_sched_synchronize(sched.get());
-    if (cparams.embeddings_nextn && ggml_time_us() - dbg_t_s0 > 50000) {
+    if (ggml_time_us() - dbg_t_s0 > 50000) {
         LLAMA_LOG_INFO("DEC_TRACE sync: ctx_type=%d %.1fms\n", (int) cparams.ctx_type, (ggml_time_us()-dbg_t_s0)/1000.0);
     }
 
@@ -1996,8 +1996,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
         dbg_t_extract += ggml_time_us() - t_ub1; dbg_n_ub++;
     } while (mctx->next());
-    if (cparams.embeddings_nextn && n_tokens_all >= 128) {
-        LLAMA_LOG_INFO("DEC_TRACE decode: ctx_type=%d n_tokens=%d n_outputs=%d n_ub=%d proc=%.1fms extract=%.1fms total=%.1fms\n",
+    if (n_tokens_all >= 128) {
+        LLAMA_LOG_INFO("DEC_TRACE decode: nextn=%d ", (int) cparams.embeddings_nextn); LLAMA_LOG_INFO("DEC_TRACE decode: ctx_type=%d n_tokens=%d n_outputs=%d n_ub=%d proc=%.1fms extract=%.1fms total=%.1fms\n",
             (int) cparams.ctx_type, (int) n_tokens_all, (int) n_outputs_all, dbg_n_ub, dbg_t_proc/1000.0, dbg_t_extract/1000.0, (ggml_time_us()-dbg_t_dec0)/1000.0);
     }
 
