@@ -1600,6 +1600,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    const int64_t dbg_s0 = ggml_time_us();
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1619,7 +1620,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    const int64_t dbg_s1 = ggml_time_us();
+    const bool dbg_ok = !backend_ids_changed && ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+    const int64_t dbg_s2 = ggml_time_us();
+    if (dbg_s2 - dbg_s0 > 100000) {
+        GGML_LOG_WARN("SCHED_TRACE alloc_splits: ids_check=%.0fms gallocr_alloc=%.0fms ok=%d ids_changed=%d\n", (dbg_s1-dbg_s0)/1000.0, (dbg_s2-dbg_s1)/1000.0, (int) dbg_ok, (int) backend_ids_changed);
+    }
+    if (!dbg_ok) {
 #ifndef NDEBUG
         GGML_LOG_WARN("SCHED_TRACE %s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -2001,10 +2008,16 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    const int64_t dbg_a0 = ggml_time_us();
     ggml_backend_sched_split_graph(sched, graph);
+    const int64_t dbg_a1 = ggml_time_us();
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+    const int64_t dbg_a2 = ggml_time_us();
+    if (dbg_a2 - dbg_a0 > 100000) {
+        GGML_LOG_WARN("SCHED_TRACE alloc_graph: split=%.0fms alloc_splits=%.0fms n_splits=%d n_nodes=%d\n", (dbg_a1-dbg_a0)/1000.0, (dbg_a2-dbg_a1)/1000.0, sched->n_splits, graph->n_nodes);
     }
 
     sched->is_alloc = true;
