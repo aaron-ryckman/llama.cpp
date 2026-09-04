@@ -675,10 +675,15 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         inpL = ggml_cont(ctx0, inpL);
         cb(inpL, "l_last_cont", -1);
     }
-    cur = build_hc_mean(ctx0, inpL);
-    cb(cur, "hc_mean", -1);
-
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    static const bool dbg_view_tail = getenv("GLM53_VIEW_TAIL") != nullptr; // experiment: no tail math (timing only, wrong h)
+    if (!mask_early && dbg_view_tail) {
+        cur = ggml_view_2d(ctx0, inpL, n_embd, inpL->ne[2], inpL->nb[2], 0);
+        cb(cur, "tail_view", -1);
+    } else {
+        cur = build_hc_mean(ctx0, inpL);
+        cb(cur, "hc_mean", -1);
+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    }
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
