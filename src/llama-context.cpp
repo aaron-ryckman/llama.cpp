@@ -1420,6 +1420,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     const int64_t dbg_u0 = ggml_time_us();
+    int64_t dbg_u1 = 0;
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1450,7 +1451,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         g_dbg_ub.t_build += ggml_time_us() - dbg_u0;
-        const int64_t dbg_u1 = ggml_time_us();
+        dbg_u1 = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1463,7 +1464,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        g_dbg_ub.t_alloc += ggml_time_us() - dbg_u1;
+        if (dbg_u1) { g_dbg_ub.t_alloc += ggml_time_us() - dbg_u1; }
         g_dbg_ub.n_splits = ggml_backend_sched_get_n_splits(sched.get());
         const int64_t dbg_u2 = ggml_time_us();
         res->set_inputs(&ubatch);
