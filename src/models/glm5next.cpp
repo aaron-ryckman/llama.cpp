@@ -1,4 +1,5 @@
 #include "models.h"
+#include <cstdlib>
 
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
@@ -659,7 +660,8 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     // unmasked nextn embeddings need all rows, so early output masking is skipped here
-    const bool mask_early = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
+    static const bool dbg_force_mask_early = getenv("GLM53_FORCE_MASK_EARLY") != nullptr; // experiment: tail cost isolation
+    const bool mask_early = dbg_force_mask_early || !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
 
     if (inp_out_ids && mask_early) {
         // get_rows needs one token's streams contiguous
