@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_embeddings_nextn (GLM53_FORCE_NEXTN experiment)
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
