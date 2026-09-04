@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -728,7 +729,7 @@ void llama_context::synchronize() {
     const int64_t dbg_t_s0 = ggml_time_us();
     ggml_backend_sched_synchronize(sched.get());
     if (ggml_time_us() - dbg_t_s0 > 50000) {
-        LLAMA_LOG_INFO("DEC_TRACE sync: ctx_type=%d %.1fms\n", (int) cparams.ctx_type, (ggml_time_us()-dbg_t_s0)/1000.0);
+        LLAMA_LOG_WARN("DEC_TRACE sync: ctx_type=%d %.1fms\n", (int) cparams.ctx_type, (ggml_time_us()-dbg_t_s0)/1000.0);
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1978,7 +1979,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                static const bool dbg_skip_nextn_copy = getenv("GLM53_SKIP_NEXTN_COPY") != nullptr; // experiment: isolate copy cost
+                if (!dbg_skip_nextn_copy) {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
             }
         }
 
@@ -1997,8 +2001,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         dbg_t_extract += ggml_time_us() - t_ub1; dbg_n_ub++;
     } while (mctx->next());
     if (n_tokens_all >= 128) {
-        LLAMA_LOG_INFO("DEC_TRACE decode: nextn=%d ", (int) cparams.embeddings_nextn); LLAMA_LOG_INFO("DEC_TRACE decode: ctx_type=%d n_tokens=%d n_outputs=%d n_ub=%d proc=%.1fms extract=%.1fms total=%.1fms\n",
-            (int) cparams.ctx_type, (int) n_tokens_all, (int) n_outputs_all, dbg_n_ub, dbg_t_proc/1000.0, dbg_t_extract/1000.0, (ggml_time_us()-dbg_t_dec0)/1000.0);
+        LLAMA_LOG_WARN("DEC_TRACE decode: nextn=%d ctx_type=%d n_tokens=%d n_outputs=%d n_ub=%d proc=%.1fms extract=%.1fms total=%.1fms\n",
+            (int) cparams.embeddings_nextn, (int) cparams.ctx_type, (int) n_tokens_all, (int) n_outputs_all, dbg_n_ub, dbg_t_proc/1000.0, dbg_t_extract/1000.0, (ggml_time_us()-dbg_t_dec0)/1000.0);
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
