@@ -1245,8 +1245,31 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    const bool changed = cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked;
+
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // The nextn tail changes the graph (extra full-row tensors, output_norm.weight becomes a leaf), so the
+    // worst-case reservation made at construction no longer matches. Without a fresh reservation ggml-alloc
+    // re-reserves on the first (arbitrary, usually small) graph, and every later ubatch overflows the
+    // context-sized host inputs (kpool_pool_reps), forcing a full backend drain + re-reserve per ubatch
+    // (measured 2x prefill slowdown on 8x gfx906 layer-split). Redo the constructor's worst-case reserve.
+    if (changed && sched && memory) {
+        synchronize();
+        const uint32_t n_seqs   = cparams.n_seq_max;
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+        auto mctx = memory->init_full();
+        if (mctx) {
+            const int64_t t0 = ggml_time_us();
+            graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+            graph_reserve(n_seqs,   n_seqs, n_seqs,       mctx.get());
+            graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+            LLAMA_LOG_INFO("%s: re-reserved worst-case graphs for embeddings_nextn=%d masked=%d (%.1f ms)\n",
+                    __func__, value, masked, (ggml_time_us() - t0) / 1000.0);
+        }
+    }
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
