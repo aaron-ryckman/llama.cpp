@@ -1003,21 +1003,21 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
+    if (talloc->size_max < node_size) {
+        GGML_LOG_WARN("ALLOC_TRACE overflow: '%s' %s [%lld,%lld,%lld,%lld] needs %zu > reserved %zu (buffer %d)\n", node->name, ggml_op_desc(node),
+            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3], node_size, talloc->size_max, talloc->buffer_id);
+    }
     return talloc->size_max >= node_size;
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (galloc->n_nodes != graph->n_nodes) {
-#ifndef NDEBUG
         GGML_LOG_WARN("ALLOC_TRACE " "%s: graph has different number of nodes\n", __func__);
-#endif
         return true;
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
-#ifndef NDEBUG
         GGML_LOG_WARN("ALLOC_TRACE " "%s: graph has different number of leafs\n", __func__);
-#endif
         return true;
     }
 
@@ -1026,9 +1026,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
-#ifndef NDEBUG
             GGML_LOG_WARN("ALLOC_TRACE " "%s: node %s is not valid\n", __func__, node->name);
-#endif
             return true;
         }
 
@@ -1038,9 +1036,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
-#ifndef NDEBUG
                 GGML_LOG_WARN("ALLOC_TRACE " "%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
-#endif
                 return true;
             }
         }
