@@ -707,7 +707,7 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
             "glm5next MTP block tensors missing; convert without --no-mtp");
     GGML_ASSERT(!layer.hc_attn_fn && "the NextN block has no mHC mixer");
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd, hparams.n_embd_inp());
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);

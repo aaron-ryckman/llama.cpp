@@ -143,7 +143,9 @@ public:
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
-    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd) {}
+    // MTP hook batches carry packed rows: [token-side embedding (n_embd_inp) | hidden state h (n_embd)].
+    // Text rows use the token id for the first part; image (mtmd) rows carry the projector embedding there.
+    llm_graph_input_embd_h(int64_t n_embd, int64_t n_embd_inp) : n_embd(n_embd), n_embd_inp(n_embd_inp) {}
     virtual ~llm_graph_input_embd_h() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -154,7 +156,8 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
-    const int64_t n_embd = 0;
+    const int64_t n_embd     = 0;
+    const int64_t n_embd_inp = 0;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {

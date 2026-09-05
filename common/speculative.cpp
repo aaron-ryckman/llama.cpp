@@ -1354,6 +1354,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // packed batch rows: [tok_embd (n_embd_inp) | h (n_embd)]; text rows use batch.token for the first part
+    int32_t n_embd_inp = 0;
+    int32_t n_row      = 0;
+    llama_token * tok_buf = nullptr; // batch.token storage; swapped to nullptr for image (embd) batches
+
+    float * h_at  (int32_t i) { return batch.embd + (size_t) i * n_row + n_embd_inp; }
+    float * tok_at(int32_t i) { return batch.embd + (size_t) i * n_row; }
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1380,11 +1388,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
+        n_embd_inp = llama_model_n_embd_inp(llama_get_model(ctx_dft));
+        n_row      = n_embd_inp + n_embd;
+
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
-        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_row, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        tok_buf = batch.token;
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1450,6 +1462,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         backend_chains.clear();
 
+        batch.token = tok_buf;
         if (batch.token != nullptr) {
             free(batch.token);
             batch.token = nullptr;
@@ -1480,8 +1493,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        // image (mtmd) batches carry projector embeddings instead of token ids: they go through the draft
+        // context too, so its KV/positions stay contiguous. The projector embedding takes the token-side
+        // slot of the packed row (the NextN block reads it instead of the embed_tokens lookup).
+        const bool is_embd_batch = batch_in.token == nullptr && batch_in.embd != nullptr;
+        if (batch_in.token == nullptr && batch_in.embd == nullptr) {
             return true;
         }
 
@@ -1514,7 +1530,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                common_batch_add(batch, is_embd_batch ? 0 : batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                if (is_embd_batch) {
+                    std::memcpy(tok_at(k), batch_in.embd + (size_t) k * n_embd_inp, (size_t) n_embd_inp * sizeof(float));
+                }
             }
 
             // shift the tgt embeddings to the right by one position
@@ -1524,12 +1543,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                for (int k = 1; k < n_tokens; ++k) {
+                    std::memcpy(h_at(k), h_tgt + (size_t) (k - 1) * n_embd, row_bytes);
+                }
             }
 
             // fill the pending embeddings from a previous run
             auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+                std::memcpy(h_at(idx), h_row, row_bytes);
             };
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1555,7 +1576,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                if (is_embd_batch) {
+                    batch.token = nullptr; // graph takes the packed token-side embedding instead of a lookup
+                }
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                batch.token = tok_buf;
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1616,7 +1641,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_sampler_reset(smpls[seq_id].get());
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            std::memcpy(h_at(batch.n_tokens - 1), pending_h[seq_id].data(), row_bytes);
 
             i_last[seq_id] = batch.n_tokens - 1;
 
@@ -1705,17 +1730,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     for (int t = 0; t < n_rows; ++t) {
                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
                         common_batch_add(batch, tok, dp.n_past + t, { seq_id }, t == n_rows - 1);
-                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                        std::memcpy(h_at(batch.n_tokens - 1),
                                     chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
                     }
                 } else if (is_mem_shared) {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
                     common_batch_add(batch, id, dp.n_past, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    std::memcpy(h_at(batch.n_tokens - 1), h_row, row_bytes);
                 } else {
                     common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    std::memcpy(h_at(batch.n_tokens - 1), h_row, row_bytes);
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
