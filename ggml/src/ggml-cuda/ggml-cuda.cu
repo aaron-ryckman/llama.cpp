@@ -1139,7 +1139,7 @@ struct ggml_cuda_p2p_ar_desc {
     int        ndev;
     int        rank;
     int64_t    n;
-    unsigned   epoch;
+    int        zero;                         // push zeros instead of data (never-computed slice)
 };
 
 static __device__ __forceinline__ void ggml_cuda_p2p_ar_spin(unsigned * f, unsigned target, int ndev, unsigned * err) {
@@ -1154,13 +1154,21 @@ static __device__ __forceinline__ void ggml_cuda_p2p_ar_spin(unsigned * f, unsig
     }
 }
 
-// K0: push my partial into every device's slot [rank]; the last block to finish publishes "arrived"
+// Per-device state words in cnt: [0] push block counter, [16] sum block counter, [8] epoch (number of reduces done).
+// The epoch lives on the device so the kernel arguments are identical every call and HIP graphs replay them.
+#define GGML_CUDA_P2P_AR_CNT_A 0
+#define GGML_CUDA_P2P_AR_CNT_B 16
+#define GGML_CUDA_P2P_AR_SEQ   8
+
+// K0: push my partial (or zeros for a never-computed slice) into every device's slot [rank]; the last block to finish
+// publishes "arrived" for epoch seq+1 and advances seq
 static __global__ void ggml_cuda_p2p_ar_push_kernel(ggml_cuda_p2p_ar_desc d) {
+    const unsigned epoch = __hip_atomic_load(d.cnt_a + GGML_CUDA_P2P_AR_SEQ, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) + 1u;
     const int64_t tid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     const int64_t nth = (int64_t) gridDim.x*blockDim.x;
     const size_t  off = (size_t) d.rank*GGML_CUDA_P2P_AR_CAP;
     for (int64_t i = tid; i < d.n; i += nth) {
-        const float v = d.data[i];
+        const float v = d.zero ? 0.0f : d.data[i];
         for (int j = 0; j < d.ndev; j++) {
             d.recv[j][off + i] = v;
         }
@@ -1168,17 +1176,21 @@ static __global__ void ggml_cuda_p2p_ar_push_kernel(ggml_cuda_p2p_ar_desc d) {
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
-        const unsigned old = atomicAdd(d.cnt_a, 1u);
-        if (old == (unsigned) gridDim.x*d.epoch - 1u) {
-            __hip_atomic_store(d.flags + d.rank*GGML_CUDA_P2P_AR_STRIDE, d.epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        const unsigned old = atomicAdd(d.cnt_a + GGML_CUDA_P2P_AR_CNT_A, 1u);
+        if (old == (unsigned) gridDim.x - 1u) {
+            atomicExch(d.cnt_a + GGML_CUDA_P2P_AR_CNT_A, 0u);
+            __hip_atomic_store(d.flags + d.rank*GGML_CUDA_P2P_AR_STRIDE, epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d.cnt_a + GGML_CUDA_P2P_AR_SEQ, epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
     }
 }
 
-// K1: wait for every peer's partial, sum my slots in place, then the last block publishes "done" and waits for all
+// K1: wait for every peer's partial of this epoch, sum my slots in place, then the last block publishes "done" and
+// waits for all peers' "done" (nobody's next push may overwrite a slot still being read)
 static __global__ void ggml_cuda_p2p_ar_sum_kernel(ggml_cuda_p2p_ar_desc d) {
+    const unsigned epoch = __hip_atomic_load(d.cnt_a + GGML_CUDA_P2P_AR_SEQ, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
     if (threadIdx.x == 0) {
-        ggml_cuda_p2p_ar_spin(d.flags, d.epoch, d.ndev, d.err);
+        ggml_cuda_p2p_ar_spin(d.flags, epoch, d.ndev, d.err);
     }
     __syncthreads();
     const int64_t tid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
@@ -1194,12 +1206,36 @@ static __global__ void ggml_cuda_p2p_ar_sum_kernel(ggml_cuda_p2p_ar_desc d) {
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
-        const unsigned old = atomicAdd(d.cnt_b, 1u);
-        if (old == (unsigned) gridDim.x*d.epoch - 1u) {
-            __hip_atomic_store(d.flags + GGML_CUDA_P2P_AR_DONE_OFF + d.rank*GGML_CUDA_P2P_AR_STRIDE, d.epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-            ggml_cuda_p2p_ar_spin(d.flags + GGML_CUDA_P2P_AR_DONE_OFF, d.epoch, d.ndev, d.err);
+        const unsigned old = atomicAdd(d.cnt_a + GGML_CUDA_P2P_AR_CNT_B, 1u);
+        if (old == (unsigned) gridDim.x - 1u) {
+            atomicExch(d.cnt_a + GGML_CUDA_P2P_AR_CNT_B, 0u);
+            __hip_atomic_store(d.flags + GGML_CUDA_P2P_AR_DONE_OFF + d.rank*GGML_CUDA_P2P_AR_STRIDE, epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            ggml_cuda_p2p_ar_spin(d.flags + GGML_CUDA_P2P_AR_DONE_OFF, epoch, d.ndev, d.err);
         }
     }
+}
+
+// launch the pair of kernels for one device (used by the comm path and by the GGML_OP_ALLREDUCE_P2P graph node)
+static void ggml_cuda_p2p_ar_launch(ggml_backend_cuda_comm_context * comm_ctx, int rank, float * data, int64_t ne, bool zero, cudaStream_t stream) {
+    ggml_cuda_p2p_ar_desc d = {};
+    for (size_t k = 0; k < comm_ctx->backends.size(); ++k) {
+        d.recv[k] = comm_ctx->p2p_recv[k];
+    }
+    d.flags = comm_ctx->p2p_flags;
+    d.err   = comm_ctx->p2p_err;
+    d.cnt_a = comm_ctx->p2p_cnt[rank];
+    d.cnt_b = comm_ctx->p2p_cnt[rank];
+    d.ndev  = (int) comm_ctx->backends.size();
+    d.rank  = rank;
+    d.n     = ne;
+    d.data  = data;
+    d.zero  = zero ? 1 : 0;
+    const int block = 256;
+    const int grid  = (int) std::min<int64_t>(16, (ne + block - 1)/block);
+    ggml_cuda_p2p_ar_push_kernel<<<grid, block, 0, stream>>>(d);
+    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_p2p_ar_sum_kernel<<<grid, block, 0, stream>>>(d);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static bool ggml_backend_cuda_comm_try_allreduce_p2p(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
@@ -1229,45 +1265,10 @@ static bool ggml_backend_cuda_comm_try_allreduce_p2p(ggml_backend_cuda_comm_cont
 #endif // GGML_USE_NCCL
         return false;
     }
-    const unsigned epoch = ++comm_ctx->p2p_epoch;
-
-    ggml_cuda_p2p_ar_desc desc = {};
-    for (size_t k = 0; k < n_backends; ++k) {
-        desc.recv[k] = comm_ctx->p2p_recv[k];
-    }
-    desc.flags = comm_ctx->p2p_flags;
-    desc.err   = comm_ctx->p2p_err;
-    desc.ndev  = (int) n_backends;
-    desc.n     = ne;
-    desc.epoch = epoch;
-
-    const int block = 256;
-    const int grid  = (int) std::min<int64_t>(16, (ne + block - 1)/block);
-
     for (size_t i = 0; i < n_backends; ++i) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
         ggml_cuda_set_device(cuda_ctx->device);
-        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { // zero-sized slice: contribute zeros
-            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
-        }
-        ggml_cuda_p2p_ar_desc d = desc;
-        d.rank  = (int) i;
-        d.data  = (float *) tensors[i]->data;
-        d.cnt_a = comm_ctx->p2p_cnt[i];
-        d.cnt_b = comm_ctx->p2p_cnt[i] + 16;
-        ggml_cuda_p2p_ar_push_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(d);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-        ggml_cuda_set_device(cuda_ctx->device);
-        ggml_cuda_p2p_ar_desc d = desc;
-        d.rank  = (int) i;
-        d.data  = (float *) tensors[i]->data;
-        d.cnt_a = comm_ctx->p2p_cnt[i];
-        d.cnt_b = comm_ctx->p2p_cnt[i] + 16;
-        ggml_cuda_p2p_ar_sum_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(d);
-        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_p2p_ar_launch(comm_ctx, (int) i, (float *) tensors[i]->data, ne, (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0, cuda_ctx->stream());
     }
     return true;
 }
@@ -1314,6 +1315,31 @@ static bool ggml_backend_cuda_comm_init_p2p(ggml_backend_cuda_comm_context * ret
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_p2p;
     GGML_LOG_INFO("%s: P2P all-reduce enabled for %zu devices (slots of %d floats, larger reduces use NCCL)\n", __func__, n, GGML_CUDA_P2P_AR_CAP);
     return true;
+}
+
+// GGML_OP_ALLREDUCE_P2P as a graph node (meta backend fused mode): op_params[0..1] = comm ctx pointer, [2] = zero flag.
+static void ggml_cuda_op_allreduce_p2p(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_backend_cuda_comm_context * comm_ctx = nullptr;
+    memcpy(&comm_ctx, dst->op_params, sizeof(comm_ctx));
+    GGML_ASSERT(comm_ctx != nullptr && comm_ctx->p2p_flags != nullptr);
+    int rank = -1;
+    for (size_t k = 0; k < comm_ctx->dev_ids.size(); ++k) {
+        if (comm_ctx->dev_ids[k] == ctx.device) {
+            rank = (int) k;
+        }
+    }
+    GGML_ASSERT(rank >= 0);
+    const ggml_tensor * src = dst->src[0];
+    const int64_t ne = ggml_nelements(src);
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && ne <= GGML_CUDA_P2P_AR_CAP);
+    ggml_cuda_p2p_ar_launch(comm_ctx, rank, (float *) src->data, ne, dst->op_params[2] != 0, ctx.stream());
+}
+
+// exported for the meta backend's fused mode: true if the comm context reduces via P2P kernels (graph-capturable)
+extern "C" bool ggml_backend_cuda_comm_is_p2p(void * comm_ctx, int64_t * cap) {
+    ggml_backend_cuda_comm_context * c = (ggml_backend_cuda_comm_context *) comm_ctx;
+    if (cap) { *cap = GGML_CUDA_P2P_AR_CAP; }
+    return c != nullptr && c->try_allreduce == ggml_backend_cuda_comm_try_allreduce_p2p;
 }
 #endif // GGML_USE_HIP
 
@@ -2648,6 +2674,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
             break;
+#ifdef GGML_USE_HIP
+        case GGML_OP_ALLREDUCE_P2P:
+            ggml_cuda_op_allreduce_p2p(ctx, dst);
+            break;
+#endif // GGML_USE_HIP
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
             break;
@@ -5751,6 +5782,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+#ifdef GGML_USE_HIP
+        case GGML_OP_ALLREDUCE_P2P:
+            return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32;
+#endif // GGML_USE_HIP
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
@@ -5931,6 +5966,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
+#ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_comm_is_p2p") == 0) {
+        return (void *) ggml_backend_cuda_comm_is_p2p;
+    }
+#endif // GGML_USE_HIP
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }
