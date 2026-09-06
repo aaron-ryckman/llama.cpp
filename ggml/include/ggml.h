@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ALLREDUCE_P2P, // tensor-parallel in-place all-reduce executed by the backend (HIP P2P kernels)
+
         GGML_OP_COUNT,
     };
 
