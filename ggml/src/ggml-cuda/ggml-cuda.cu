@@ -1003,12 +1003,18 @@ struct ggml_backend_cuda_comm_context {
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    // P2P all-reduce mode (HIP): coherent host flags for the device-side barrier, epoch counter, error mask.
+    unsigned *                  p2p_flags   = nullptr;
+    unsigned *                  p2p_err     = nullptr;
+    unsigned                    p2p_epoch   = 0;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
+        if (p2p_flags != nullptr) { cudaFreeHost(p2p_flags); }
+        if (p2p_err   != nullptr) { cudaFreeHost(p2p_err);   }
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1094,6 +1100,175 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     return true;
 }
 #endif // GGML_USE_NCCL
+
+// ---------------------------------------------------------------------------------------------------------------
+// P2P all-reduce for tensor parallelism on HIP: two kernel launches per device per step and no host-side collective.
+//
+// Measured motivation (8x MI50, ROCm 6.3.4): every RCCL all-reduce costs ~115 us of host time (ncclGroupEnd) on a
+// busy stream, and with ~90 reduce steps per token the host, not the fabric, bounds decode. Here each device
+// publishes "my partial is ready" (release store to a coherent host flag), waits for all peers (system-scope
+// acquire loads), sums all partials straight out of peer memory over PCIe P2P into a scratch buffer, publishes
+// "done reading", waits for all peers, and copies the sum back in place. Host cost per step: ~4 us per device.
+// Requires peer access between all devices (enabled at init) and F32 contiguous tensors; anything else falls back.
+// ---------------------------------------------------------------------------------------------------------------
+#ifdef GGML_USE_HIP
+#define GGML_CUDA_P2P_AR_STRIDE   16   // one 64-byte line per device flag
+#define GGML_CUDA_P2P_AR_DONE_OFF (GGML_CUDA_MAX_DEVICES*GGML_CUDA_P2P_AR_STRIDE)
+
+struct ggml_cuda_p2p_ar_desc {
+    const float * in[GGML_CUDA_MAX_DEVICES];
+    float *       out;
+    unsigned *    flags;
+    unsigned *    err;
+    int           ndev;
+    int           rank;
+    int64_t       n;
+    unsigned      epoch;
+};
+
+static __device__ __forceinline__ void ggml_cuda_p2p_ar_spin(unsigned * f, unsigned target, int ndev, unsigned * err) {
+    for (int d = 0; d < ndev; d++) {
+        unsigned long long spins = 0;
+        while (__hip_atomic_load(f + d*GGML_CUDA_P2P_AR_STRIDE, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < target) {
+            if (++spins > (1ull << 31)) { // ~seconds: give up instead of hanging the device
+                atomicOr(err, 1u << d);
+                return;
+            }
+        }
+    }
+}
+
+// wait until every device has published its partial for this epoch, then sum all partials (peer loads) into out
+static __global__ void ggml_cuda_p2p_ar_sum_kernel(ggml_cuda_p2p_ar_desc d) {
+    if (threadIdx.x == 0) {
+        if (blockIdx.x == 0) {
+            __threadfence_system();
+            __hip_atomic_store(d.flags + d.rank*GGML_CUDA_P2P_AR_STRIDE, d.epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        ggml_cuda_p2p_ar_spin(d.flags, d.epoch, d.ndev, d.err);
+    }
+    __syncthreads();
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < d.n; i += (int64_t) gridDim.x*blockDim.x) {
+        float s = 0.0f;
+        for (int k = 0; k < d.ndev; k++) {
+            s += d.in[k][i];
+        }
+        d.out[i] = s;
+    }
+}
+
+// wait until every device has finished reading the partials for this epoch, then copy the sum back in place
+static __global__ void ggml_cuda_p2p_ar_copy_kernel(ggml_cuda_p2p_ar_desc d, const float * scratch, float * dst) {
+    if (threadIdx.x == 0) {
+        if (blockIdx.x == 0) {
+            __threadfence_system();
+            __hip_atomic_store(d.flags + GGML_CUDA_P2P_AR_DONE_OFF + d.rank*GGML_CUDA_P2P_AR_STRIDE, d.epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        ggml_cuda_p2p_ar_spin(d.flags + GGML_CUDA_P2P_AR_DONE_OFF, d.epoch, d.ndev, d.err);
+    }
+    __syncthreads();
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < d.n; i += (int64_t) gridDim.x*blockDim.x) {
+        dst[i] = scratch[i];
+    }
+}
+
+static bool ggml_backend_cuda_comm_try_allreduce_p2p(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    const size_t n_backends = comm_ctx->backends.size();
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if (ne == 0) {
+        return true;
+    }
+    if (n_backends < 2 || n_backends > (size_t) GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    for (size_t i = 0; i < n_backends; ++i) {
+        if (tensors[i] == nullptr || tensors[i]->type != GGML_TYPE_F32 || !ggml_is_contiguously_allocated(tensors[i]) ||
+                ggml_nelements(tensors[i]) != ne) {
+            return false;
+        }
+    }
+    if (comm_ctx->p2p_err != nullptr && *comm_ctx->p2p_err != 0) {
+        GGML_LOG_ERROR("%s: a previous P2P all-reduce barrier timed out (mask 0x%x); refusing further P2P reduces\n", __func__, *comm_ctx->p2p_err);
+        return false;
+    }
+    const unsigned epoch = ++comm_ctx->p2p_epoch;
+
+    ggml_cuda_p2p_ar_desc desc = {};
+    for (size_t k = 0; k < n_backends; ++k) {
+        desc.in[k] = (const float *) tensors[k]->data;
+    }
+    desc.flags = comm_ctx->p2p_flags;
+    desc.err   = comm_ctx->p2p_err;
+    desc.ndev  = (int) n_backends;
+    desc.n     = ne;
+    desc.epoch = epoch;
+
+    const int block = 256;
+    const int grid  = (int) std::min<int64_t>(64, (ne + block - 1)/block);
+
+    ggml_cuda_pool_alloc<float> scratch[GGML_CUDA_MAX_DEVICES];
+    // zero partials that were never computed (zero-sized slices), then launch the sum kernels
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+        }
+        scratch[i].pool = &cuda_ctx->pool();
+        scratch[i].alloc(ne);
+        ggml_cuda_p2p_ar_desc d = desc;
+        d.rank = (int) i;
+        d.out  = scratch[i].get();
+        ggml_cuda_p2p_ar_sum_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(d);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_p2p_ar_desc d = desc;
+        d.rank = (int) i;
+        ggml_cuda_p2p_ar_copy_kernel<<<grid, block, 0, cuda_ctx->stream()>>>(d, scratch[i].get(), (float *) tensors[i]->data);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_comm_init_p2p(ggml_backend_cuda_comm_context * ret) {
+    const size_t n = ret->dev_ids.size();
+    if (n < 2 || n > (size_t) GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        ggml_cuda_set_device(ret->dev_ids[i]);
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j) {
+                continue;
+            }
+            int can = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can, ret->dev_ids[i], ret->dev_ids[j]));
+            if (!can) {
+                GGML_LOG_WARN("%s: device %d cannot access peer %d; P2P all-reduce unavailable\n", __func__, ret->dev_ids[i], ret->dev_ids[j]);
+                return false;
+            }
+            cudaError_t e = cudaDeviceEnablePeerAccess(ret->dev_ids[j], 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+                GGML_LOG_WARN("%s: enabling peer access %d->%d failed: %s\n", __func__, ret->dev_ids[i], ret->dev_ids[j], cudaGetErrorString(e));
+                return false;
+            }
+            (void) cudaGetLastError();
+        }
+    }
+    ggml_cuda_set_device(ret->dev_ids[0]);
+    const size_t flag_bytes = 2*GGML_CUDA_MAX_DEVICES*GGML_CUDA_P2P_AR_STRIDE*sizeof(unsigned);
+    CUDA_CHECK(cudaHostAlloc((void **) &ret->p2p_flags, flag_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+    memset(ret->p2p_flags, 0, flag_bytes);
+    CUDA_CHECK(cudaHostAlloc((void **) &ret->p2p_err, sizeof(unsigned), cudaHostAllocMapped | cudaHostAllocPortable));
+    *ret->p2p_err = 0;
+    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_p2p;
+    GGML_LOG_INFO("%s: P2P all-reduce enabled for %zu devices\n", __func__, n);
+    return true;
+}
+#endif // GGML_USE_HIP
 
 // Run the internal AR pipeline.  Returns false on unsupported / failed input
 // -- the caller decides whether to abort (env-forced) or fall back silently.
@@ -1258,6 +1433,13 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         std::string env_str(env);
         if (env_str == "nccl") {
             ggml_backend_cuda_comm_init_nccl(ret);
+#ifdef GGML_USE_HIP
+        } else if (env_str == "p2p") {
+            if (!ggml_backend_cuda_comm_init_p2p(ret)) {
+                GGML_LOG_WARN("P2P all-reduce init failed; falling back to NCCL/internal\n");
+                ggml_backend_cuda_comm_init_nccl(ret);
+            }
+#endif // GGML_USE_HIP
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {
