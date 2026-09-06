@@ -1013,8 +1013,10 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
-        if (p2p_flags != nullptr) { cudaFreeHost(p2p_flags); }
-        if (p2p_err   != nullptr) { cudaFreeHost(p2p_err);   }
+#ifdef GGML_USE_HIP
+        if (p2p_flags != nullptr) { hipHostFree(p2p_flags); }
+        if (p2p_err   != nullptr) { hipHostFree(p2p_err);   }
+#endif // GGML_USE_HIP
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1260,9 +1262,9 @@ static bool ggml_backend_cuda_comm_init_p2p(ggml_backend_cuda_comm_context * ret
     }
     ggml_cuda_set_device(ret->dev_ids[0]);
     const size_t flag_bytes = 2*GGML_CUDA_MAX_DEVICES*GGML_CUDA_P2P_AR_STRIDE*sizeof(unsigned);
-    CUDA_CHECK(cudaHostAlloc((void **) &ret->p2p_flags, flag_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+    CUDA_CHECK(hipHostMalloc((void **) &ret->p2p_flags, flag_bytes, hipHostMallocMapped | hipHostMallocPortable | hipHostMallocCoherent));
     memset(ret->p2p_flags, 0, flag_bytes);
-    CUDA_CHECK(cudaHostAlloc((void **) &ret->p2p_err, sizeof(unsigned), cudaHostAllocMapped | cudaHostAllocPortable));
+    CUDA_CHECK(hipHostMalloc((void **) &ret->p2p_err, sizeof(unsigned), hipHostMallocMapped | hipHostMallocPortable | hipHostMallocCoherent));
     *ret->p2p_err = 0;
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_p2p;
     GGML_LOG_INFO("%s: P2P all-reduce enabled for %zu devices\n", __func__, n);
