@@ -851,6 +851,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+            if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+                GGML_LOG_ERROR("%s: no split state for tensor '%s' (%s, ne=[%ld,%ld,%ld,%ld], op %s, buffer %s)\n", __func__,
+                    tensor->name, ggml_type_name(tensor->type), (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3],
+                    ggml_op_name(tensor->op), ggml_backend_buffer_name(tensor->buffer));
+            }
             if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
                 const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
                 int64_t ne_sum = 0;
