@@ -1891,6 +1891,7 @@ struct ggml_backend_meta_context {
         std::vector<cgraph_config>           cgraphs;
         std::vector<ggml_tensor *>           nodes;
         std::vector<ggml_backend_buffer_ptr> bufs;
+        ggml_cgraph *                        cgraph_fused = nullptr;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
@@ -1910,6 +1911,12 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     std::unique_ptr<ggml_backend_meta_dispatch_pool> dispatch_pool; // created lazily when GGML_META_PARALLEL_DISPATCH=1
+    // Fused mode (GGML_META_FUSED_P2P=1 with a P2P-capable comm): one cgraph per device per compute with the
+    // all-reduce as GGML_OP_ALLREDUCE_P2P nodes inline, so the backend can replay a whole token as one HIP graph.
+    bool                       fused_p2p    = false;   // requested and supported by the comm layer
+    bool                       fused_ok     = false;   // decided per rebuild (every reduce fits the P2P slot)
+    int64_t                    fused_cap    = 0;
+    std::vector<ggml_tensor *> fused_reduce_nodes;     // [n_backends * max_subgraphs]
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -1938,6 +1945,14 @@ struct ggml_backend_meta_context {
             }
         }
         if (comm_ctx != nullptr) {
+            typedef bool (*comm_is_p2p_t)(void *, int64_t *);
+            comm_is_p2p_t comm_is_p2p = (comm_is_p2p_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_is_p2p");
+            const char * env_fused = getenv("GGML_META_FUSED_P2P");
+            if (env_fused != nullptr && atoi(env_fused) != 0 && comm_is_p2p != nullptr) {
+                fused_p2p = comm_is_p2p(comm_ctx, &fused_cap);
+                GGML_LOG_INFO("%s: fused P2P mode %s\n", __func__, fused_p2p ? "enabled" : "requested but the comm layer is not in P2P mode");
+            }
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
@@ -2373,8 +2388,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
+            const size_t mem_per_device_fused = backend_ctx->fused_p2p ?
+                ggml_graph_overhead_custom(backend_ctx->max_nnodes + backend_ctx->max_subgraphs, cgraph->grads) + backend_ctx->max_subgraphs*ggml_tensor_overhead() : 0;
             const ggml_init_params params = {
-                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
+                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux + mem_per_device_fused),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
@@ -2392,6 +2409,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->nodes_aux.resize(n_backends*n_nodes_per_device*backend_ctx->max_subgraphs);
             for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
                 backend_ctx->nodes_aux[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
+            }
+            if (backend_ctx->fused_p2p) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->backend_configs[j].cgraph_fused = ggml_new_graph_custom(
+                        backend_ctx->ctx.get(), backend_ctx->max_nnodes + backend_ctx->max_subgraphs, /*grads =*/ false);
+                }
+                backend_ctx->fused_reduce_nodes.resize(n_backends*backend_ctx->max_subgraphs);
+                for (size_t k = 0; k < backend_ctx->fused_reduce_nodes.size(); k++) {
+                    backend_ctx->fused_reduce_nodes[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
+                }
             }
         }
 
@@ -2411,6 +2438,53 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
                 cgraph_ij->uid = ggml_graph_next_uid();
+            }
+        }
+
+        // fused mode: one cgraph per device with the reduces inline (only if every reduce fits the P2P slot)
+        backend_ctx->fused_ok = backend_ctx->fused_p2p && n_backends > 1;
+        for (size_t i_graph = 0; backend_ctx->fused_ok && i_graph + 1 < n_subgraphs; i_graph++) {
+            const size_t i_last = backend_ctx->backend_configs[0].cgraphs[i_graph + 1].offset - 1;
+            const ggml_tensor * partial = cgraph->nodes[i_last];
+            if (partial->type != GGML_TYPE_F32 || ggml_nelements(partial) > backend_ctx->fused_cap) {
+                backend_ctx->fused_ok = false;
+            }
+        }
+        if (backend_ctx->fused_ok) {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * cf = bcj.cgraph_fused;
+                cf->n_nodes = 0;
+                ggml_hash_set_reset(&cf->visited_hash_set);
+                for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
+                    const size_t i_node_start = bcj.cgraphs[i_graph].offset;
+                    const size_t i_node_stop  = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
+                    for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
+                        ggml_tensor * node_ij = bcj.nodes[i_node];
+                        cf->nodes[cf->n_nodes++] = node_ij;
+                        const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
+                        const size_t hash_pos_ij = ggml_hash_insert(&cf->visited_hash_set, node_ij);
+                        cf->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
+                    }
+                    if (i_graph + 1 < n_subgraphs) {
+                        ggml_tensor * partial = bcj.nodes[i_node_stop - 1];
+                        ggml_tensor * r = backend_ctx->fused_reduce_nodes[j*backend_ctx->max_subgraphs + i_graph];
+                        r->op   = GGML_OP_ALLREDUCE_P2P;
+                        r->type = partial->type;
+                        for (int k = 0; k < GGML_MAX_DIMS; k++) { r->ne[k] = partial->ne[k]; r->nb[k] = partial->nb[k]; }
+                        r->src[0]    = partial;
+                        r->view_src  = partial;
+                        r->view_offs = 0;
+                        r->data      = partial->data;
+                        r->buffer    = partial->buffer;
+                        r->flags     = 0;
+                        memcpy(r->op_params, &backend_ctx->comm_ctx, sizeof(void *));
+                        r->op_params[2] = (partial->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ? 1 : 0;
+                        ggml_format_name(r, "allreduce_p2p_%zu", i_graph);
+                        cf->nodes[cf->n_nodes++] = r;
+                    }
+                }
+                cf->uid = ggml_graph_next_uid();
             }
         }
     }
@@ -2567,6 +2641,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }();
     if (parallel_dispatch && n_backends > 1 && !backend_ctx->dispatch_pool) {
         backend_ctx->dispatch_pool.reset(new ggml_backend_meta_dispatch_pool(n_backends));
+    }
+
+    if (backend_ctx->fused_ok) {
+        // refresh the in-place reduce nodes' data pointers (the allocator may move a partial between graphs)
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_cgraph * cf = backend_ctx->backend_configs[j].cgraph_fused;
+            for (int i = 0; i < cf->n_nodes; i++) {
+                ggml_tensor * r = cf->nodes[i];
+                if (r->op == GGML_OP_ALLREDUCE_P2P) {
+                    r->data   = r->src[0]->data;
+                    r->buffer = r->src[0]->buffer;
+                }
+            }
+        }
+        if (backend_ctx->dispatch_pool) {
+            return backend_ctx->dispatch_pool->run([&](size_t j) -> ggml_status {
+                auto & bcj = backend_ctx->backend_configs[j];
+                return ggml_backend_graph_compute_async(bcj.backend, bcj.cgraph_fused);
+            });
+        }
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraph_fused);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
     }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
