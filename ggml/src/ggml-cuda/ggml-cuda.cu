@@ -805,6 +805,27 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    // Tensor-parallel weight uploads arrive here as many narrow rows (e.g. a quant block of 144 bytes repeated a
+    // million times for an expert tensor split along its input dimension). A pitched 2D copy of that shape is
+    // pathologically slow on HIP (hours for a 186 GB model). When the destination rows are contiguous, gather the
+    // strided host rows into a staging chunk and issue linear copies instead.
+    if (stride_tensor == size && n_copies > 1 && size < (1u << 20)) {
+        const size_t chunk_bytes = 64u << 20;
+        const size_t chunk_rows  = std::max<size_t>(1, chunk_bytes / size);
+        static thread_local std::vector<char> staging;
+        staging.resize(chunk_rows * size);
+        for (size_t r0 = 0; r0 < n_copies; r0 += chunk_rows) {
+            const size_t nr = std::min(chunk_rows, n_copies - r0);
+            for (size_t i = 0; i < nr; i++) {
+                memcpy(staging.data() + i*size, (const char *) data + (r0 + i)*stride_data, size);
+            }
+            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + r0*size, staging.data(), nr*size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        }
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
