@@ -1125,29 +1125,23 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
+        // The tensor struct at this address changed (graphs are rebuilt at the same addresses every call). Only this
+        // entry is stale: every other entry re-validates itself on lookup. Clearing the whole cache here defeated
+        // memoization mid-resolution and made the recursive descent through the residual stream thousands of frames
+        // deep and exponential over reconvergent paths (stack overflow / multi-minute stalls in llama-server).
+        buf_ctx->split_state_cache.erase(it);
         it = buf_ctx->split_state_cache.end();
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
         {
-            // Cycle detector: the resolver recurses into sources before this tensor's result is memoized, so a
-            // pointer loop among sources/views recurses until the stack overflows (seen with llama-server graphs).
-            static thread_local std::vector<const ggml_tensor *> path;
-            for (size_t i = 0; i < path.size(); i++) {
-                if (path[i] == tensor) {
-                    GGML_LOG_ERROR("%s: cycle in the tensor graph while resolving split states (%zu tensors on the path):\n", __func__, path.size() - i);
-                    for (size_t k = i; k < path.size(); k++) {
-                        const ggml_tensor * x = path[k];
-                        GGML_LOG_ERROR("  '%s' op=%s view_src='%s' src0='%s' src1='%s' src2='%s' buffer=%s\n", x->name, ggml_op_name(x->op),
-                            x->view_src ? x->view_src->name : "-", x->src[0] ? x->src[0]->name : "-", x->src[1] ? x->src[1]->name : "-",
-                            x->src[2] ? x->src[2]->name : "-", x->buffer ? ggml_backend_buffer_name(x->buffer) : "-");
-                    }
-                    GGML_ABORT("split-state cycle");
-                }
+            static thread_local int depth = 0;
+            struct depth_scope { int & d; depth_scope(int & d) : d(d) { d++; } ~depth_scope() { d--; } } ds(depth);
+            static thread_local bool warned = false;
+            if (depth > 4096 && !warned) {
+                warned = true;
+                GGML_LOG_WARN("%s: split-state recursion depth > 4096 at tensor '%s' (memoization is not taking effect)\n", __func__, tensor->name);
             }
-            path.push_back(tensor);
-            struct pop_guard { ~pop_guard() { path.pop_back(); } } pg;
             buf_ctx->split_state_cache[key].first = calculate_split_state();
         }
         memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
