@@ -600,19 +600,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return src_ss[0];
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis == concat_axis && src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
-            // concatenation along the split axis: the result is the sources' segments back to back
-            // (e.g. GLM-5-Next's q|k|v for one conv over three head-split projections)
-            ggml_backend_meta_split_state ret = src_ss[0];
-            GGML_ASSERT(src_ss[0].n_segments + src_ss[1].n_segments <= 16);
-            for (size_t s = 0; s < src_ss[1].n_segments; s++) {
-                const size_t d = ret.n_segments + s;
-                for (size_t j = 0; j < n_bufs; j++) {
-                    ret.ne[d*n_bufs + j] = src_ss[1].ne[s*n_bufs + j];
-                }
-                ret.nr[d] = src_ss[1].nr[s];
-            }
-            ret.n_segments += src_ss[1].n_segments;
-            return ret;
+            // concatenation along the split axis (e.g. GLM-5-Next's q|k|v before one conv): each device holds its slice of
+            // both sources back to back. Compute tensors carry one segment; the per-device sizes are derived from the
+            // first source's ratio below.
+            return {src_ss[0].axis, {0}, {1}, 1};
         }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
@@ -843,16 +834,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
-            // the channel split (with its segments, e.g. q|k|v) carries over; channels move from axis 1 of the input to axis 0 of the output
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
-                ggml_backend_meta_split_state ret = src_ss[0];
-                ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
-                return ret;
+                return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
             }
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
-                ggml_backend_meta_split_state ret = src_ss[0];
-                ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
-                return ret;
+                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
             }
         }
         return handle_generic(src_ss, /*scalar_only =*/ false);
