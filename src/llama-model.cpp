@@ -372,6 +372,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+    const bool is_glm5next = ud->model->arch == LLM_ARCH_GLM5NEXT;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -469,6 +470,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        if (is_glm5next) {
+            // First cut of tensor parallelism for GLM-5-Next / GLM-5.3-Flash: only the FFN and expert weights are sharded
+            // (generic rules below). Everything else runs mirrored on every device: the KDA linear-attention block
+            // (ssm_*, attn_q/k/v/output with 3 conv1d tensors), the DSA/MLA block (attn_q_a/q_b/kv_a_mqa/k_b/v_b/output),
+            // the lightning indexer and its compressor, the hyper-connection tensors, the MoE router, NextN and all caches.
+            // Mirrored attention keeps the indexer's top-k identical on every device and reduces the per-layer
+            // synchronization to one all-reduce after the expert down projection.
+            static const std::regex pattern_glm5next_mirrored(
+                "blk\\.\\d*\\.(attn_.*|ssm_.*|indexer.*|hc_.*|nextn\\..*|exp_probs_b\\.bias|ffn_gate_inp\\.weight)|cache_.*");
+            if (std::regex_match(tensor_name, pattern_glm5next_mirrored)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
