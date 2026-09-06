@@ -550,6 +550,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_LOG_ERROR("%s: inconsistent source split states for '%s' (op %s, scalar_only=%d):\n", __func__,
+                tensor->name, ggml_op_name(tensor->op), scalar_only);
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] != nullptr) {
+                    GGML_LOG_ERROR("  src%zu '%s' (op %s, ne=[%ld,%ld,%ld,%ld]) axis=%s n_segments=%zu\n", i, tensor->src[i]->name,
+                        ggml_op_name(tensor->src[i]->op), (long) tensor->src[i]->ne[0], (long) tensor->src[i]->ne[1],
+                        (long) tensor->src[i]->ne[2], (long) tensor->src[i]->ne[3],
+                        ggml_backend_meta_split_axis_name(src_ss[i].axis), src_ss[i].n_segments);
+                }
+            }
+        }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
     };
