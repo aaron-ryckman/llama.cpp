@@ -2050,6 +2050,11 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
+    // Views of host-resident tensors reach a meta split's node list as inputs (the scheduler feeds consumers a
+    // device-side copy). They are no-ops for the per-device subgraphs and are skipped consistently below.
+    auto is_host_view = [](const ggml_tensor * t) -> bool {
+        return t->view_src != nullptr && t->view_src->buffer != nullptr && ggml_backend_buffer_is_host(t->view_src->buffer);
+    };
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
@@ -2097,7 +2102,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->buffer != nullptr && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (is_host_view(node)) {
                     // Views of host-resident tensors reach the split's node list as inputs (the scheduler feeds the actual
                     // consumers a device-side copy). This covers both raw inputs (s_copy_main) and views of tensors computed
                     // on the CPU, e.g. "embd (reshaped)" when the embedding lookup runs on the CPU (GLM-5-Next).
@@ -2243,7 +2248,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
 
-                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    if (is_host_view(next)) {
                         continue;
                     }
                     if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -2279,17 +2284,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
+            // the scheduler may append host-view inputs after the last real node; the final subgraph closes at the last real node
+            int i_last = cgraph->n_nodes - 1;
+            while (i_last > 0 && is_host_view(cgraph->nodes[i_last])) {
+                i_last--;
+            }
             int i_start = 0;
-            for (int i = 0; i < cgraph->n_nodes; i++) {
+            for (int i = 0; i <= i_last; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (is_host_view(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool new_subgraph = i == i_last || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -2320,7 +2330,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 n_subgraphs++;
                 i_start = i + 1;
             }
-            GGML_ASSERT(i_start == cgraph->n_nodes);
+            GGML_ASSERT(i_start == i_last + 1);
         }
 
         backend_ctx->uid         = cgraph->uid;
