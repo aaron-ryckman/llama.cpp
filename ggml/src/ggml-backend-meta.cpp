@@ -505,26 +505,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     if (tensor->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->buffer)) {
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     }
-    // Diagnostic guard: the resolver recurses through sources and view sources; a cycle overflows the stack silently.
-    struct depth_guard {
-        static int & depth() { static thread_local int d = 0; return d; }
-        static std::vector<const ggml_tensor *> & chain() { static thread_local std::vector<const ggml_tensor *> c; return c; }
-        explicit depth_guard(const ggml_tensor * t) {
-            chain().push_back(t);
-            if (++depth() > 256) {
-                GGML_LOG_ERROR("ggml_backend_meta_get_split_state: recursion depth > 256; last 12 tensors of the chain:\n");
-                const auto & c = chain();
-                for (size_t i = c.size() >= 12 ? c.size() - 12 : 0; i < c.size(); i++) {
-                    const ggml_tensor * x = c[i];
-                    GGML_LOG_ERROR("  [%zu] '%s' op=%s view_src=%s src0=%s src1=%s buffer=%s\n", i, x->name, ggml_op_name(x->op),
-                        x->view_src ? x->view_src->name : "-", x->src[0] ? x->src[0]->name : "-", x->src[1] ? x->src[1]->name : "-",
-                        x->buffer ? ggml_backend_buffer_name(x->buffer) : "-");
-                }
-                GGML_ABORT("split-state recursion cycle");
-            }
-        }
-        ~depth_guard() { --depth(); chain().pop_back(); }
-    } dg(tensor);
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
@@ -1150,7 +1130,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
+        {
+            // Cycle detector: the resolver recurses into sources before this tensor's result is memoized, so a
+            // pointer loop among sources/views recurses until the stack overflows (seen with llama-server graphs).
+            static thread_local std::vector<const ggml_tensor *> path;
+            for (size_t i = 0; i < path.size(); i++) {
+                if (path[i] == tensor) {
+                    GGML_LOG_ERROR("%s: cycle in the tensor graph while resolving split states (%zu tensors on the path):\n", __func__, path.size() - i);
+                    for (size_t k = i; k < path.size(); k++) {
+                        const ggml_tensor * x = path[k];
+                        GGML_LOG_ERROR("  '%s' op=%s view_src='%s' src0='%s' src1='%s' src2='%s' buffer=%s\n", x->name, ggml_op_name(x->op),
+                            x->view_src ? x->view_src->name : "-", x->src[0] ? x->src[0]->name : "-", x->src[1] ? x->src[1]->name : "-",
+                            x->src[2] ? x->src[2]->name : "-", x->buffer ? ggml_backend_buffer_name(x->buffer) : "-");
+                    }
+                    GGML_ABORT("split-state cycle");
+                }
+            }
+            path.push_back(tensor);
+            struct pop_guard { ~pop_guard() { path.pop_back(); } } pg;
+            buf_ctx->split_state_cache[key].first = calculate_split_state();
+        }
         memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
