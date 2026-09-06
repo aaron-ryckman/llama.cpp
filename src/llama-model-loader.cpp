@@ -1065,6 +1065,8 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
             return cur_buft;
         }
+        LLAMA_LOG_DEBUG("%s: tensor '%s' (%s, op %s): buffer type %s on device %s not supported, trying the next one\n", __func__,
+            ggml_get_name(tensor), ggml_type_name(tensor->type), ggml_op_name(op), ggml_backend_buft_name(cur_buft), ggml_backend_dev_name(cur_dev));
     }
 
     return nullptr;
