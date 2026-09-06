@@ -472,7 +472,10 @@ static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t meta_buf, size_t index) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
+    if (!ggml_backend_buffer_is_meta(meta_buf)) {
+        GGML_LOG_ERROR("%s: buffer '%s' is not a meta buffer\n", __func__, meta_buf ? ggml_backend_buffer_name(meta_buf) : "(null)");
+        GGML_ABORT("buffer is not a meta buffer");
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) meta_buf->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
     return buf_ctx->bufs[index].get();
@@ -2095,6 +2098,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
                     bcj.nodes[i] = node;
                     continue;
+                }
+                if (j == 0) {
+                    for (int k = 0; k < GGML_MAX_SRC; k++) {
+                        const ggml_tensor * src = node->src[k];
+                        if (src != nullptr && src->buffer != nullptr && !ggml_backend_buffer_is_meta(src->buffer)) {
+                            GGML_LOG_WARN("%s: node '%s' (op %s) src[%d] '%s' (op %s, view_src %s) lives in non-meta buffer '%s'\n", __func__,
+                                node->name, ggml_op_name(node->op), k, src->name, ggml_op_name(src->op),
+                                src->view_src ? src->view_src->name : "-", ggml_backend_buffer_name(src->buffer));
+                        }
+                    }
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 GGML_ASSERT(bcj.nodes[i]);
