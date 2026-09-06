@@ -402,6 +402,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
+    // GLM-5-Next KDA (linear attention) layers: one conv over q|k|v with three conv1d weights, low-rank f/g gates
+    static const std::regex pattern_glm_conv        ("blk\\.\\d*\\.ssm_conv1d_(q|k|v)\\.weight");
+    static const std::regex pattern_glm_fgb         ("blk\\.\\d*\\.ssm_(f|g)_b\\.weight");
+    static const std::regex pattern_glm_fga         ("blk\\.\\d*\\.ssm_(f|g)_a\\.weight");
+    static const std::regex pattern_glm_ssm_norm    ("blk\\.\\d*\\.ssm_norm\\.weight");
+    static const std::regex pattern_glm_mirrored_any("blk\\.\\d*\\.(indexer.*|hc_.*|nextn\\..*|exp_probs_b\\.bias|ffn_gate_inp\\.weight)");
 
     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
     static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
@@ -471,16 +477,44 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     auto get_tensor_config = [&]() -> tensor_config {
         if (is_glm5next) {
-            // First cut of tensor parallelism for GLM-5-Next / GLM-5.3-Flash: only the FFN and expert weights are sharded
-            // (generic rules below). Everything else runs mirrored on every device: the KDA linear-attention block
-            // (ssm_*, attn_q/k/v/output with 3 conv1d tensors), the DSA/MLA block (attn_q_a/q_b/kv_a_mqa/k_b/v_b/output),
-            // the lightning indexer and its compressor, the hyper-connection tensors, the MoE router, NextN and all caches.
-            // Mirrored attention keeps the indexer's top-k identical on every device and reduces the per-layer
-            // synchronization to one all-reduce after the expert down projection.
-            static const std::regex pattern_glm5next_mirrored(
-                "blk\\.\\d*\\.(attn_.*|ssm_.*|indexer.*|hc_.*|nextn\\..*|exp_probs_b\\.bias|ffn_gate_inp\\.weight)|cache_.*");
-            if (std::regex_match(tensor_name, pattern_glm5next_mirrored)) {
+            // GLM-5-Next / GLM-5.3-Flash. KDA (linear attention) layers are sharded by head like Qwen3-Next, with
+            // attn_output.weight as the head-partition reference (GLM has no ssm_out). The DSA/MLA layers, the
+            // lightning indexer, the hyper-connections, the router, NextN and the DSA caches stay mirrored: the MLA
+            // cache is one latent shared by all heads and the indexer's top-k must be identical on every device.
+            // The FFN and expert weights use the generic sharding rules on every layer.
+            int il_glm = -1;
+            if (tensor_name.rfind("blk.", 0) == 0) {
+                il_glm = std::stoi(tensor_name.substr(4));
+            } else if (tensor_name.rfind("cache_", 0) == 0) {
+                const size_t p = tensor_name.rfind("_l");
+                if (p != std::string::npos) {
+                    il_glm = std::stoi(tensor_name.substr(p + 2));
+                }
+            }
+            const bool kda = il_glm >= 0 && (uint32_t) il_glm < hparams.n_layer() && hparams.is_recr(il_glm);
+            if (std::regex_match(tensor_name, pattern_glm_mirrored_any)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (kda) {
+                if (std::regex_match(tensor_name, pattern_glm_conv)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+                }
+                if (std::regex_match(tensor_name, pattern_glm_fgb) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+                }
+                if (std::regex_match(tensor_name, pattern_glm_fga) || std::regex_match(tensor_name, pattern_glm_ssm_norm)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+                if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
+                        std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+                }
+                // attn_q/k/v (axis 1) and attn_output (axis 0): generic rules below, reference attn_output.weight
+            } else {
+                static const std::regex pattern_glm5next_mirrored("blk\\.\\d*\\.(attn_.*|ssm_.*)|cache_.*");
+                if (std::regex_match(tensor_name, pattern_glm5next_mirrored)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
             }
         }
         if (is_dsv4) {
@@ -607,6 +641,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        if (is_glm5next && hparams.is_recr(il)) {
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                // conv state for the concatenated q|k|v streams: three head-partitioned segments
+                const int64_t seg = (hparams.ssm_d_conv - 1) * hparams.n_head(il) * hparams.n_embd_head_kda;
+                GGML_ASSERT(tensor->ne[axis] == 3*seg);
+                return {{seg, 3}};
+            }
+            return {{tensor->ne[axis], 1}};
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
@@ -684,9 +727,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
-            const int64_t head_dim        = hparams.ssm_d_state;
+            const int64_t head_dim        = hparams.n_embd_head_kda != 0 ? hparams.n_embd_head_kda : hparams.ssm_d_state;
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
+            if (is_glm5next) {
+                if (std::regex_match(tensor_name, pattern_glm_conv) || std::regex_match(tensor_name, pattern_glm_fgb) ||
+                        std::regex_match(tensor_name, pattern_ssm_dt)) {
+                    return std::vector<int64_t>(segments.size(), granularity_qkv);   // per channel (dt is per channel in GLM)
+                }
+            }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);

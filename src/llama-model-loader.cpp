@@ -920,6 +920,11 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
 
+    if (op == GGML_OP_SSM_SCAN && hparams.n_embd_head_kda != 0) {
+        // KDA models use ssm_a in an element-wise gate, not in an SSM scan; probing with SSM_SCAN sends it to the CPU
+        op = GGML_OP_MUL;
+    }
+
     if (op == GGML_OP_NONE) {
         return true;
     }
