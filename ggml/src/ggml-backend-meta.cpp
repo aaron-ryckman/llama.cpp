@@ -2477,7 +2477,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         r->view_offs = 0;
                         r->data      = partial->data;
                         r->buffer    = partial->buffer;
-                        r->flags     = 0;
+                        r->flags     = GGML_TENSOR_FLAG_COMPUTE; // the backend skips nodes without it
                         memcpy(r->op_params, &backend_ctx->comm_ctx, sizeof(void *));
                         r->op_params[2] = (partial->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ? 1 : 0;
                         ggml_format_name(r, "allreduce_p2p_%zu", i_graph);
