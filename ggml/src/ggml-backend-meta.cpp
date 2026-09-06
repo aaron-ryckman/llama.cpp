@@ -479,7 +479,11 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
 }
 
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        GGML_LOG_ERROR("%s: tensor '%s' (op %s) lives in buffer '%s', which is not a meta buffer\n", __func__,
+            tensor->name, ggml_op_name(tensor->op), tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(null)");
+        GGML_ABORT("tensor not in a meta buffer");
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
