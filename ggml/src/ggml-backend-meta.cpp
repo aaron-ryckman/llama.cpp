@@ -11,6 +11,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <map>
 #include <memory>
 #include <set>
@@ -1772,6 +1778,72 @@ static ggml_guid_t ggml_backend_meta_guid() {
     return &guid;
 }
 
+// Persistent worker pool used to enqueue each step's per-device subgraph concurrently.
+// Rationale: ggml_backend_graph_compute_async costs ~100 us of host time per call on ROCm (HIP graph
+// launch/update or per-kernel launches), and the meta backend issues it once per device per reduce step.
+// Serially that is n_devices x n_steps x 100 us per token (~100 ms for 8 GPUs x 90 steps), during which the
+// devices idle. Dispatching from one thread per device brings the host cost back to ~n_steps x 100 us.
+// Enabled with GGML_META_PARALLEL_DISPATCH=1 (default off until validated on more backends).
+struct ggml_backend_meta_dispatch_pool {
+    std::vector<std::thread>          workers;
+    std::mutex                        mtx;
+    std::condition_variable           cv_start;
+    std::condition_variable           cv_done;
+    uint64_t                          generation = 0;
+    size_t                            n_pending  = 0;
+    bool                              stop       = false;
+    std::function<ggml_status(size_t)> job;
+    std::vector<ggml_status>          results;
+
+    explicit ggml_backend_meta_dispatch_pool(size_t n) : results(n, GGML_STATUS_SUCCESS) {
+        for (size_t j = 0; j < n; j++) {
+            workers.emplace_back([this, j]() {
+                uint64_t seen = 0;
+                for (;;) {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv_start.wait(lock, [&]{ return stop || generation != seen; });
+                    if (stop) {
+                        return;
+                    }
+                    seen = generation;
+                    lock.unlock();
+                    const ggml_status st = job(j);
+                    lock.lock();
+                    results[j] = st;
+                    if (--n_pending == 0) {
+                        cv_done.notify_one();
+                    }
+                }
+            });
+        }
+    }
+    ~ggml_backend_meta_dispatch_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv_start.notify_all();
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+    // Runs fn(j) for every worker j concurrently; returns the first non-success status.
+    ggml_status run(std::function<ggml_status(size_t)> fn) {
+        std::unique_lock<std::mutex> lock(mtx);
+        job       = std::move(fn);
+        n_pending = workers.size();
+        generation++;
+        cv_start.notify_all();
+        cv_done.wait(lock, [&]{ return n_pending == 0; });
+        for (const ggml_status st : results) {
+            if (st != GGML_STATUS_SUCCESS) {
+                return st;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+};
+
 struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
@@ -1803,6 +1875,7 @@ struct ggml_backend_meta_context {
     uint64_t                    uid           = 0;
 
     void *                               comm_ctx       = nullptr;
+    std::unique_ptr<ggml_backend_meta_dispatch_pool> dispatch_pool; // created lazily when GGML_META_PARALLEL_DISPATCH=1
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -2431,12 +2504,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    static const bool parallel_dispatch = [](){
+        const char * env = getenv("GGML_META_PARALLEL_DISPATCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (parallel_dispatch && n_backends > 1 && !backend_ctx->dispatch_pool) {
+        backend_ctx->dispatch_pool.reset(new ggml_backend_meta_dispatch_pool(n_backends));
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+        if (backend_ctx->dispatch_pool) {
+            const ggml_status status = backend_ctx->dispatch_pool->run([&](size_t j) -> ggml_status {
+                auto & bcj = backend_ctx->backend_configs[j];
+                return ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+            });
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
+            }
+        } else {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
 
