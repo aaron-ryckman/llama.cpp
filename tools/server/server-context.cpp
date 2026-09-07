@@ -2644,7 +2644,7 @@ private:
                         slot->spec_ckpt.clear();
                         slot->spec_draft.clear();
                         slot->spec_i_batch.clear();
-                        SLT_INF(*slot, "DISAGG restore: slot now holds %zu tokens (n_read = %zu)\n", slot->prompt.tokens.size(), nread);
+                        SLT_DBG(*slot, "restore-trace: restore: slot now holds %zu tokens (n_read = %zu)\n", slot->prompt.tokens.size(), nread);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3151,7 +3151,7 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        SLT_INF(slot, "DISAGG launch: slot has %zu tokens, task has %d, common prefix = %zu, cache_prompt = %d\n",
+                        SLT_DBG(slot, "restore-trace: launch: slot has %zu tokens, task has %d, common prefix = %zu, cache_prompt = %d\n",
                                 slot.prompt.tokens.size(), slot.task->n_tokens(), slot.prompt.tokens.get_common_prefix(input_tokens), (int) slot.task->params.cache_prompt);
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3297,7 +3297,7 @@ private:
                                 n_past = 0;
                             }
 
-                            SLT_INF(slot, "DISAGG n_past after prefix/reuse = %d\n", n_past);
+                            SLT_DBG(slot, "restore-trace: n_past after prefix/reuse = %d\n", n_past);
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3356,7 +3356,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                SLT_INF(slot, "DISAGG checkpoint gate: pos_min = %d, pos_min_thold = %d, pos_next = %d, n_swa = %d, has_new_tokens = %d\n",
+                                SLT_DBG(slot, "restore-trace: checkpoint gate: pos_min = %d, pos_min_thold = %d, pos_next = %d, n_swa = %d, has_new_tokens = %d\n",
                                         (int) pos_min, (int) pos_min_thold, (int) pos_next, (int) n_swa, (int) has_new_tokens);
                                 if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
@@ -3423,7 +3423,7 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        SLT_INF(slot, "DISAGG n_past after checkpoint block = %d (checkpoints = %zu)\n", n_past, slot.prompt.checkpoints.size());
+                        SLT_DBG(slot, "restore-trace: n_past after checkpoint block = %d (checkpoints = %zu)\n", n_past, slot.prompt.checkpoints.size());
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
