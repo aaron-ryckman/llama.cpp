@@ -3473,7 +3473,11 @@ private:
                     // The memory's own last position decides whether anything must go (the token list may already have been
                     // reset to 0 by the checkpoint logic while the memory still holds the previous conversation).
                     const llama_pos pos_max_cur = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                    const bool nothing_beyond = pos_max_cur < p0;
+                    // Two signals: the memory's last position, and the token list. DeepSeek V4's compressed memory reports
+                    // pos_max one past the last token, so an exact-prefix continuation shows pos_max == p0; that is not a
+                    // divergence. A real divergence has cached tokens beyond p0 (token list longer than p0).
+                    const bool prefix_covers_cache = (size_t) p0 >= slot.prompt.tokens.size();
+                    const bool nothing_beyond = pos_max_cur < p0 || (prefix_covers_cache && pos_max_cur <= p0);
                     if (nothing_beyond) {
                         SLT_DBG(slot, "skipping memory_seq_rm [%d, end): memory pos_max %d, cached prefix %zu tokens\n", (int) p0, (int) pos_max_cur, slot.prompt.tokens.size());
                     } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
