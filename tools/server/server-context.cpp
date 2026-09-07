@@ -3468,9 +3468,12 @@ private:
                     // Memories that only support whole-sequence removal (compressed caches such as DeepSeek V4's) abort on a
                     // partial seq_rm. After a /slots/:id?action=restore nothing exists beyond the cached prefix, so the trim
                     // is a no-op: skip it when the memory's last position is already below p0.
+                    // Whether anything must actually go: the slot's token list is the authority (a restored memory can report
+                    // pos_max one past the list). p0 == n_tokens means the cached prefix is exactly what the prompt needs.
                     const llama_pos pos_max_cur = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                    if (pos_max_cur < p0) {
-                        SLT_DBG(slot, "skipping memory_seq_rm [%d, end): memory ends at %d\n", (int) p0, (int) pos_max_cur);
+                    const bool nothing_beyond = (size_t) p0 >= slot.prompt.tokens.size();
+                    if (nothing_beyond) {
+                        SLT_DBG(slot, "skipping memory_seq_rm [%d, end): cached prefix is %zu tokens (memory pos_max %d)\n", (int) p0, slot.prompt.tokens.size(), (int) pos_max_cur);
                     } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && p0 > 0) {
                         // The memory cannot remove a partial range (compressed caches, DeepSeek V4) and the prompt diverged
                         // from the cached tokens mid-sequence (an edited conversation, a compaction). Without a checkpoint the
