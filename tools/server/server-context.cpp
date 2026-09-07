@@ -3280,6 +3280,7 @@ private:
                                 n_past = 0;
                             }
 
+                            SLT_INF(slot, "DISAGG n_past after prefix/reuse = %d\n", n_past);
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3401,6 +3402,7 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
+                        SLT_INF(slot, "DISAGG n_past after checkpoint block = %d (checkpoints = %zu)\n", n_past, slot.prompt.checkpoints.size());
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
