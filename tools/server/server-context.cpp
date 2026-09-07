@@ -3363,8 +3363,14 @@ private:
                                     // /slots/:id?action=restore from another instance) needs no checkpoint to continue: every
                                     // position up to n_past is there. The reset below exists for SWA/hybrid memories that have
                                     // discarded old positions; that cannot be the case when pos_min == 0.
-                                    if (do_reset && pos_min == 0) {
-                                        SLT_INF(slot, "no checkpoint but memory holds the full sequence from pos 0 (n_past = %d); continuing without reset\n", n_past);
+                                    // A restored sequence (/slots/:id?action=restore) has no checkpoints, and a compressed-cache
+                                    // model (DeepSeek V4 DSA/HCA) reports pos_min just below pos_next because only the latest
+                                    // window is addressable. The reset below protects against generating from positions the memory
+                                    // has discarded; when the memory holds the last position of the prefix (pos_min < pos_next) and
+                                    // the task adds no new tokens beyond it, generation can continue from the restored state directly.
+                                    if (do_reset && pos_min >= 0 && pos_min < pos_next && !has_new_tokens) {
+                                        SLT_INF(slot, "no checkpoint, but memory holds the sequence end (pos_min = %d, pos_next = %d, n_past = %d); continuing without reset\n",
+                                                (int) pos_min, (int) pos_next, n_past);
                                         do_reset = false;
                                     }
 
