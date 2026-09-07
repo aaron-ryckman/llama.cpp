@@ -3474,11 +3474,14 @@ private:
                     const bool nothing_beyond = (size_t) p0 >= slot.prompt.tokens.size();
                     if (nothing_beyond) {
                         SLT_DBG(slot, "skipping memory_seq_rm [%d, end): cached prefix is %zu tokens (memory pos_max %d)\n", (int) p0, slot.prompt.tokens.size(), (int) pos_max_cur);
-                    } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && p0 > 0) {
+                    } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        // p0 == 0 (a different conversation took over this slot) reaches here too: seq_rm(0, -1) on this
+                        // memory returns success without emptying it, and the fresh prefill from 0 is then rejected as
+                        // non-consecutive. Every whole-sequence removal goes through the erase-and-verify path.
                         // The memory cannot remove a partial range (compressed caches, DeepSeek V4) and the prompt diverged
                         // from the cached tokens mid-sequence (an edited conversation, a compaction). Without a checkpoint the
                         // only correct move is to drop the whole sequence and re-prefill; aborting here took the server down.
-                        SLT_WRN(slot, "prompt diverges at %d from a cached sequence ending at %d on a whole-sequence-removal memory: re-prefilling from 0\n",
+                        SLT_WRN(slot, "prompt shares %d tokens with a cached sequence ending at %d on a whole-sequence-removal memory: clearing and re-prefilling from 0\n",
                                 (int) p0, (int) pos_max_cur);
                         slot.prompt_clear();   // seq_rm(-1,-1) on the memory + clear the prompt, exactly what SLOT_ERASE does
                         {
