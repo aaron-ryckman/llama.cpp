@@ -3426,8 +3426,20 @@ private:
                         SLT_DBG(slot, "restore-trace: n_past after checkpoint block = %d (checkpoints = %zu)\n", n_past, slot.prompt.checkpoints.size());
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                                // Re-evaluating the last cached position needs a one-token seq_rm that this memory cannot do
+                                // (the batch would be rejected as non-consecutive). The prompt is entirely cached: drop the
+                                // sequence and re-prefill it. Slow, but the alternative is a 500 to the client.
+                                SLT_WRN(slot, "%s", "whole-sequence-removal memory: re-prefilling the fully cached prompt from 0\n");
+                                slot.prompt_clear();
+                                if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= 0) {
+                                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                                }
+                                n_past = 0;
+                            } else {
+                                n_past--;
+                                SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            }
                         }
 
                         slot.stats.n_prompt_cached    = n_past;
