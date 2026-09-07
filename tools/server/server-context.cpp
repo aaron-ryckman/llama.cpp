@@ -3370,7 +3370,7 @@ private:
                                     // the task adds no new tokens beyond it, generation can continue from the restored state directly.
                                     // (pos_next here is the position right after the cached prefix; new tokens are evaluated from
                                     // there on, so nothing before it is recomputed either way.)
-                                    if (do_reset && pos_min >= 0 && pos_min < pos_next) {
+                                    if (do_reset && pos_min >= 0 && pos_min <= pos_next) {
                                         SLT_INF(slot, "no checkpoint, but memory holds the sequence end (pos_min = %d, pos_next = %d, n_past = %d); continuing without reset\n",
                                                 (int) pos_min, (int) pos_next, n_past);
                                         do_reset = false;
