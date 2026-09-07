@@ -2627,6 +2627,12 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        // the restored memory is a fresh snapshot: any speculative checkpoint taken before it is stale
+                        // and loading it in pre_decode reads a state that no longer matches (observed: SIGSEGV in
+                        // llama_io_read_host::read via common_prompt_checkpoint::load_tgt after a restore)
+                        slot->spec_ckpt.clear();
+                        slot->spec_draft.clear();
+                        slot->spec_i_batch.clear();
                         SLT_INF(*slot, "DISAGG restore: slot now holds %zu tokens (n_read = %zu)\n", slot->prompt.tokens.size(), nread);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
