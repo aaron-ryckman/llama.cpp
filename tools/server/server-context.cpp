@@ -3365,24 +3365,18 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
-                                    // A sequence that is fully present in memory from position 0 (for example one just loaded by
-                                    // /slots/:id?action=restore from another instance) needs no checkpoint to continue: every
-                                    // position up to n_past is there. The reset below exists for SWA/hybrid memories that have
-                                    // discarded old positions; that cannot be the case when pos_min == 0.
-                                    // A restored sequence (/slots/:id?action=restore) has no checkpoints, and a compressed-cache
-                                    // model (DeepSeek V4 DSA/HCA) reports pos_min just below pos_next because only the latest
-                                    // window is addressable. The reset below protects against generating from positions the memory
-                                    // has discarded; when the memory holds the last position of the prefix (pos_min < pos_next) and
-                                    // the task adds no new tokens beyond it, generation can continue from the restored state directly.
-                                    // (pos_next here is the position right after the cached prefix; new tokens are evaluated from
-                                    // there on, so nothing before it is recomputed either way.)
-                                    if (do_reset && pos_min >= 0 && pos_min <= pos_next) {
-                                        SLT_INF(slot, "no checkpoint, but memory holds the sequence end (pos_min = %d, pos_next = %d, n_past = %d); continuing without reset\n",
+                                    // A restored sequence (/slots/:id?action=restore) has no checkpoints. The reset below exists for
+                                    // SWA/hybrid memories that discarded old positions; a restored memory still holds the resume
+                                    // point (pos_min <= pos_next), so continue from n_past as computed by the prefix match: neither
+                                    // reset nor load a checkpoint (there is none to load; `it` is rend() here).
+                                    const bool restored_continues = do_reset && pos_min >= 0 && pos_min <= pos_next;
+                                    if (restored_continues) {
+                                        SLT_INF(slot, "no checkpoint, but memory holds the resume point (pos_min = %d, pos_next = %d, n_past = %d); continuing\n",
                                                 (int) pos_min, (int) pos_next, n_past);
                                         do_reset = false;
                                     }
 
-                                    if (!do_reset) {
+                                    if (!do_reset && !restored_continues) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
