@@ -1646,7 +1646,12 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // A slot whose current tokens already share a long prefix with the incoming task (for example one
+                // that was just filled by /slots/:id?action=restore from a prefill instance) must keep them when the
+                // host-RAM cache has nothing better: clearing it here threw away a valid KV and forced a full prefill.
+                const size_t lcp_cur = ret->prompt.tokens.get_common_prefix(task.tokens);
+                const bool cur_is_good = ret->prompt.tokens.size() > 0 && lcp_cur >= ret->prompt.tokens.size() * 3 / 4;
+                if (!ret->prompt_load(*prompt_cache, task.tokens) && !cur_is_good) {
                     ret->prompt_clear();
                 }
 
