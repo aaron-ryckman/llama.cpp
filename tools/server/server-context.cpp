@@ -2627,6 +2627,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        SLT_INF(*slot, "DISAGG restore: slot now holds %zu tokens (n_read = %zu)\n", slot->prompt.tokens.size(), nread);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3133,6 +3134,8 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        SLT_INF(slot, "DISAGG launch: slot has %zu tokens, task has %d, common prefix = %zu, cache_prompt = %d\n",
+                                slot.prompt.tokens.size(), slot.task->n_tokens(), slot.prompt.tokens.get_common_prefix(input_tokens), (int) slot.task->params.cache_prompt);
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
