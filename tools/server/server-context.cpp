@@ -3356,6 +3356,15 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    // A sequence that is fully present in memory from position 0 (for example one just loaded by
+                                    // /slots/:id?action=restore from another instance) needs no checkpoint to continue: every
+                                    // position up to n_past is there. The reset below exists for SWA/hybrid memories that have
+                                    // discarded old positions; that cannot be the case when pos_min == 0.
+                                    if (do_reset && pos_min == 0) {
+                                        SLT_INF(slot, "no checkpoint but memory holds the full sequence from pos 0 (n_past = %d); continuing without reset\n", n_past);
+                                        do_reset = false;
+                                    }
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
