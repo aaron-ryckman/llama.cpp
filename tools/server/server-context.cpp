@@ -3470,10 +3470,12 @@ private:
                     // is a no-op: skip it when the memory's last position is already below p0.
                     // Whether anything must actually go: the slot's token list is the authority (a restored memory can report
                     // pos_max one past the list). p0 == n_tokens means the cached prefix is exactly what the prompt needs.
+                    // The memory's own last position decides whether anything must go (the token list may already have been
+                    // reset to 0 by the checkpoint logic while the memory still holds the previous conversation).
                     const llama_pos pos_max_cur = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                    const bool nothing_beyond = (size_t) p0 >= slot.prompt.tokens.size();
+                    const bool nothing_beyond = pos_max_cur < p0;
                     if (nothing_beyond) {
-                        SLT_DBG(slot, "skipping memory_seq_rm [%d, end): cached prefix is %zu tokens (memory pos_max %d)\n", (int) p0, slot.prompt.tokens.size(), (int) pos_max_cur);
+                        SLT_DBG(slot, "skipping memory_seq_rm [%d, end): memory pos_max %d, cached prefix %zu tokens\n", (int) p0, (int) pos_max_cur, slot.prompt.tokens.size());
                     } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                         // p0 == 0 (a different conversation took over this slot) reaches here too: seq_rm(0, -1) on this
                         // memory returns success without emptying it, and the fresh prefill from 0 is then rejected as
