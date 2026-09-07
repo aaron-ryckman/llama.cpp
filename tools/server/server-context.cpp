@@ -3339,6 +3339,8 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
+                                SLT_INF(slot, "DISAGG checkpoint gate: pos_min = %d, pos_min_thold = %d, pos_next = %d, n_swa = %d, has_new_tokens = %d\n",
+                                        (int) pos_min, (int) pos_min_thold, (int) pos_next, (int) n_swa, (int) has_new_tokens);
                                 if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
