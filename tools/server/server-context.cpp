@@ -3480,8 +3480,15 @@ private:
                         // only correct move is to drop the whole sequence and re-prefill; aborting here took the server down.
                         SLT_WRN(slot, "prompt diverges at %d from a cached sequence ending at %d on a whole-sequence-removal memory: re-prefilling from 0\n",
                                 (int) p0, (int) pos_max_cur);
-                        slot.mem.seq_rm(slot.id, -1, -1);
-                        slot.prompt.tokens.keep_first(0);
+                        slot.prompt_clear();   // seq_rm(-1,-1) on the memory + clear the prompt, exactly what SLOT_ERASE does
+                        {
+                            const llama_pos pm = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            if (pm >= 0) {
+                                // the memory still holds positions: a fresh prefill from 0 would be rejected as non-consecutive
+                                SLT_ERR(slot, "sequence %d still holds positions up to %d after a full clear; clearing the whole memory\n", slot.id, (int) pm);
+                                llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                            }
+                        }
                     } else {
                         slot.mem.seq_rm(slot.id, p0, -1);
                     }
