@@ -3454,7 +3454,15 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // Memories that only support whole-sequence removal (compressed caches such as DeepSeek V4's) abort on a
+                    // partial seq_rm. After a /slots/:id?action=restore nothing exists beyond the cached prefix, so the trim
+                    // is a no-op: skip it when the memory's last position is already below p0.
+                    const llama_pos pos_max_cur = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    if (pos_max_cur >= p0) {
+                        slot.mem.seq_rm(slot.id, p0, -1);
+                    } else {
+                        SLT_INF(slot, "skipping memory_seq_rm [%d, end): memory ends at %d\n", (int) p0, (int) pos_max_cur);
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
