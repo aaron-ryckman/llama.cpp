@@ -2627,6 +2627,17 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        // The saved token list can run one past the memory (the slot appends its last sampled token
+                        // to the list even for n_predict = 0). A memory that only supports whole-sequence removal
+                        // (DeepSeek V4) cannot trim that token later, so align the list to the memory now.
+                        {
+                            const llama_pos pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                            const size_t n_in_mem = pos_max_mem < 0 ? 0 : (size_t) pos_max_mem + 1;
+                            if (slot->prompt.tokens.size() > n_in_mem) {
+                                SLT_INF(*slot, "restore: trimming token list %zu -> %zu to match memory\n", slot->prompt.tokens.size(), n_in_mem);
+                                slot->prompt.tokens.keep_first(n_in_mem);
+                            }
+                        }
                         // the restored memory is a fresh snapshot: any speculative checkpoint taken before it is stale
                         // and loading it in pre_decode reads a state that no longer matches (observed: SIGSEGV in
                         // llama_io_read_host::read via common_prompt_checkpoint::load_tgt after a restore)
