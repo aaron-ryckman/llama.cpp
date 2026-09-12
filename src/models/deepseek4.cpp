@@ -489,7 +489,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
         int64_t ratio,
         int64_t n_embd_head,
         const char * name,
-        int il) const {
+        int il,
+        ggml_tensor ** pre_rope) const {
     const int64_t n_embd_head_rope = hparams.n_rot();
     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
     const int64_t n_blocks         = comp_pos ? comp_pos->ne[0] : 0;
@@ -519,6 +520,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
     cb(comp, name, il);
+
+    // V4.1 builds its index keys from this form, before RoPE (model.py Compressor: "Pre-RoPE is deliberate: the indexer needs the unrotated form")
+    if (pre_rope) {
+        *pre_rope = comp;
+    }
 
     comp = ggml_rope_ext(ctx0, comp, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
             hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
@@ -789,7 +795,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
         float kq_scale,
         int il,
         int il_kv,
-        bool idx_tier) const {
+        bool idx_tier,
+        ggml_tensor * top_k) const {
     // il_kv is the layer that owns the compressed rows.
     // For V4 that is this layer; V4.1 has the layers after a source read the source's cache, which is the only place they differ.
     const auto & inp_hca = idx_tier ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
@@ -825,7 +832,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     cb(k_all, "hca_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * hca_mask = inp_hca.kq_mask;
+    // V4.1 sparse selection keeps only the rows the indexer picked; the 128-token window in raw_mask stays whole, as the reference concatenates window and compressed picks (model.py:774-778)
+    ggml_tensor * hca_mask = top_k
+        ? build_top_k_mask(inp_hca.kq_mask, top_k, "hca_top_k_mask", il)
+        : inp_hca.kq_mask;
 
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
     cb(kq_mask, "hca_kq_mask", il);
@@ -837,6 +847,265 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     cb(out, "attn_hca", il);
 
     return out;
+}
+
+// DeepSeek-V4.1 sparse selection (CSA2), opt-in with LLAMA_DSV41_TOPK=1.
+//
+// The reference (DeepSeek-V4.1-Flash inference/model.py) spreads the selection over three kinds of layer:
+//  - a KV source (2, 8, 14 at ratio 2; 20 at ratio 1) pools its compressed latent and, before rotating it, derives one
+//    index key per compressed row: k = rms_norm(wk(latent)) with RoPE on the last n_rot dims at the row's first token
+//    (Indexer.forward, model.py:537-548). Every layer up to the next source reads the same rows and the same keys.
+//  - an index source (2, 8, 14, 20, 24, 28, 32, 36) scores its own queries against those keys,
+//    score[t] = sum_h relu(q_h . k_t) * w_h with w = weights_proj(x) * index_head_dim**-0.5 * n_heads**-0.5
+//    (model.py:550-557), masks the rows the query has not passed yet (model.py:561-566) and keeps the best
+//    index_topk = 512 (model.py:578-580). V4 scores with the same formula, so the fused lightning indexer applies.
+//  - every other compressed layer reuses the rows its nearest index source picked (model.py:722-737).
+//  - the candidate source (20) also ranks blocks of candidate_block_size rows by their best row, pins the block
+//    holding the query's newest row, keeps candidate_topk_blocks of them (select_candidate_blocks, model.py:583-610),
+//    and the index sources after it (24..36) only score inside those blocks (model.py:569-576). Below
+//    candidate_topk_blocks * candidate_block_size = 16384 rows every block is a candidate and this changes nothing.
+// The picks are always added to the 128-token sliding window (model.py:774-778), never instead of it.
+//
+// Here the index keys live in a K-only cache that mirrors the tier's compressed cache row for row (kv_lid for
+// ratio 2, kv_lid_plain for ratio 1), so the tier's plan (write ids, positions, visibility mask) serves both.
+// What V4.1 does not do: no Hadamard on the indexer in the model itself; the rotation applied below is the
+// cache's own quantization aid, orthonormal, and applied to both sides, so q.k is unchanged.
+// Not reproduced: the reference's fp4/fp8 activation quantization of q, k and the compressed rows.
+
+static bool dsv41_candidates_enabled(const llama_hparams & hparams) {
+    return hparams.dsv41_candidate_topk > 0 && hparams.dsv41_candidate_block > 0 &&
+           hparams.dsv41_is_index_source(hparams.dsv41_candidate_src_layer);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_dsv41_index_keys(
+        const llama_model & model,
+        llm_graph_input_dsv4 * inp_dsv4,
+        const llm_graph_input_dsv4::comp_input & tier,
+        const llama_kv_cache_dsv4_comp_context * lid_ctx,
+        ggml_tensor * latent_pre,
+        int il) const {
+    const auto & layer = model.layers[il];
+
+    const int64_t n_embd_index      = hparams.indexer_head_size;
+    const int64_t n_embd_index_rope = hparams.n_rot();
+    const int64_t n_embd_index_nope = n_embd_index - n_embd_index_rope;
+
+    GGML_ASSERT(lid_ctx);
+    GGML_ASSERT(latent_pre);
+    GGML_ASSERT(layer.indexer_comp_wkv && layer.indexer_comp_norm && "V4.1 KV source without indexer key tensors");
+    GGML_ASSERT(tier.state_write_idxs && tier.state_write_pos);
+    GGML_ASSERT(n_embd_index >= n_embd_index_rope);
+
+    // latent_pre is [n_embd_head, 1, n_blocks]: pooled and normed, before RoPE (Compressor.forward, model.py:458-486)
+    ggml_tensor * k = build_lora_mm(layer.indexer_comp_wkv, latent_pre);
+    k = build_norm(k, layer.indexer_comp_norm, nullptr, LLM_NORM_RMS, il);
+    cb(k, "dsv41_idx_k_new", il);
+
+    // a row stands for the first token of its group and takes that position, with the compressed tier's rope (model.py:538-546)
+    k = ggml_rope_ext(ctx0, k, tier.state_write_pos, nullptr, n_embd_index_rope, rope_type, n_ctx_orig,
+            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+    k = ggml_rope_set_offset(k, n_embd_index_nope);
+    cb(k, "dsv41_idx_k_new_rope", il);
+
+    // both index-key caches share hparams_lid, so one rotation matrix fits both
+    if (inp_dsv4->get_lid().k_rot) {
+        k = llama_mul_mat_hadamard(ctx0, k, inp_dsv4->get_lid().k_rot);
+        cb(k, "dsv41_idx_k_new_rot", il);
+    }
+
+    // same row ids as the compressed KV of this tier, incomplete-group scratch row included
+    return lid_ctx->cpy_k(ctx0, k, tier.state_write_idxs, il);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_dsv41_select_mask(
+        ggml_tensor * idxs,
+        int64_t n_rows,
+        ggml_type type,
+        const char * name,
+        int il) const {
+    const int64_t n_sel    = idxs->ne[0];
+    const int64_t nt       = idxs->ne[1];
+    const int64_t n_stream = idxs->ne[3];
+
+    GGML_ASSERT(idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(idxs->ne[2] == 1);
+    GGML_ASSERT(n_sel > 0 && n_sel <= n_rows);
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
+
+    // same layout trick as build_top_k_mask(): rows of width 1 so set_rows() can scatter per (token, stream)
+    ggml_tensor * all = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, type, 1, n_rows, nt, n_stream), -INFINITY);
+    ggml_tensor * sel = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, type, 1, n_sel,  nt, n_stream), 0.0f);
+
+    ggml_tensor * idxs_3d = ggml_view_4d(ctx0, idxs, n_sel, nt, n_stream, 1,
+            idxs->nb[1], idxs->nb[2], n_stream*idxs->nb[3], 0);
+
+    ggml_tensor * mask = ggml_set_rows(ctx0, all, sel, idxs_3d);
+    mask = ggml_view_4d(ctx0, mask, n_rows, nt, 1, n_stream, mask->nb[2], mask->nb[3], mask->nb[3], 0);
+    cb(mask, name, il);
+
+    return mask;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_dsv41_candidate_mask(
+        ggml_tensor * score,
+        ggml_tensor * kq_mask,
+        int il) const {
+    const int64_t n_kv     = score->ne[0];
+    const int64_t nt       = score->ne[1];
+    const int64_t n_stream = score->ne[3];
+    const int64_t bsz      = hparams.dsv41_candidate_block;
+
+    GGML_ASSERT(score->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(score) && ggml_is_contiguous(kq_mask));
+    GGML_ASSERT(ggml_are_same_shape(score, kq_mask));
+    GGML_ASSERT(score->ne[2] == 1);
+    // the plan pads n_kv to a multiple of 256, so the reference's -inf tail padding to a whole block is already there
+    GGML_ASSERT(bsz > 0 && n_kv % bsz == 0);
+
+    const int64_t n_blocks = n_kv/bsz;
+    GGML_ASSERT(n_blocks > 1);
+
+    // a block scores as its best row (model.py:598-600). Unreachable rows are -inf in score; a block of only those pools
+    // to -FLT_MAX, which ranks the same, and its rows stay -inf in the score whatever the block decision is.
+    ggml_tensor * bscore = ggml_pool_1d(ctx0, score, GGML_OP_POOL_MAX, (int) bsz, (int) bsz, 0);
+    cb(bscore, "dsv41_cand_block_score", il);
+
+    // pin the block holding the query's newest reachable row (model.py:602-605): a block with any reachable row pools the
+    // 0/-inf mask to 0 and exp() makes that 1, an unreachable block gives 0; the newest is the reachable block whose
+    // successor is not.
+    ggml_tensor * bvis = ggml_exp(ctx0, ggml_pool_1d(ctx0, kq_mask, GGML_OP_POOL_MAX, (int) bsz, (int) bsz, 0));
+    ggml_tensor * bvis_next = ggml_concat(ctx0,
+            ggml_cont(ctx0, ggml_view_4d(ctx0, bvis, n_blocks - 1, nt, 1, n_stream,
+                    bvis->nb[1], bvis->nb[2], bvis->nb[3], ggml_element_size(bvis))),
+            ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nt, 1, n_stream), 0.0f),
+            0);
+    ggml_tensor * is_last = ggml_mul(ctx0, bvis, ggml_scale_bias(ctx0, bvis_next, -1.0f, 1.0f));
+    cb(is_last, "dsv41_cand_last_block", il);
+
+    // a finite huge pin rather than +inf, so a 0 * inf can never produce a NaN
+    bscore = ggml_add(ctx0, bscore, ggml_scale(ctx0, is_last, 1e30f));
+    cb(bscore, "dsv41_cand_block_score_pinned", il);
+
+    const int64_t n_top_blocks = std::min<int64_t>(n_blocks, hparams.dsv41_candidate_topk);
+    ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, bscore, (int) n_top_blocks));
+    cb(top_blocks, "dsv41_cand_top_blocks", il);
+
+    // 0 on the kept blocks, -inf elsewhere, spread over the bsz rows of each block (model.py:607-610)
+    ggml_tensor * bmask = build_dsv41_select_mask(top_blocks, n_blocks, GGML_TYPE_F32, "dsv41_cand_block_mask", il);
+    ggml_tensor * cand = ggml_reshape_4d(ctx0, bmask, 1, n_blocks, nt, n_stream);
+    cand = ggml_repeat_4d(ctx0, cand, bsz, n_blocks, nt, n_stream);
+    cand = ggml_reshape_4d(ctx0, cand, n_kv, nt, 1, n_stream);
+    cb(cand, "dsv41_cand_mask", il);
+
+    return cand;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_dsv41_indexer_top_k(
+        const llama_model & model,
+        llm_graph_input_dsv4 * inp_dsv4,
+        const llm_graph_input_dsv4::comp_input & tier,
+        const llama_kv_cache_dsv4_comp_context * lid_ctx,
+        int il_keys,
+        ggml_tensor * qr,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il) const {
+    const auto & layer = model.layers[il];
+
+    const int64_t n_embd_index      = hparams.indexer_head_size;
+    const int64_t n_embd_index_rope = hparams.n_rot();
+    const int64_t n_embd_index_nope = n_embd_index - n_embd_index_rope;
+    const int64_t n_index_head      = hparams.indexer_n_head;
+    const int64_t nt                = cur->ne[1];
+
+    GGML_ASSERT(tier.kq_mask);
+    GGML_ASSERT(lid_ctx);
+    GGML_ASSERT(layer.indexer_attn_q_b && layer.indexer_proj && "V4.1 index source without indexer query tensors");
+    GGML_ASSERT(n_embd_index >= n_embd_index_rope);
+
+    // q = wq_b(qr) per index head, qr being the normalized low-rank query; RoPE on the tail at the query position with
+    // the compressed tier's rope (model.py:550-551)
+    ggml_tensor * q = build_lora_mm(layer.indexer_attn_q_b, qr);
+    q = ggml_reshape_3d(ctx0, q, n_embd_index, n_index_head, nt);
+    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_index_rope, rope_type, n_ctx_orig,
+            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+    q = ggml_rope_set_offset(q, n_embd_index_nope);
+    cb(q, "dsv41_idx_q", il);
+
+    if (inp_dsv4->get_lid().k_rot) {
+        q = llama_mul_mat_hadamard(ctx0, q, inp_dsv4->get_lid().k_rot);
+        cb(q, "dsv41_idx_q_rot", il);
+    }
+
+    // per-head weights with the reference's softmax_scale * n_heads**-0.5 folded in (model.py:555)
+    ggml_tensor * w = build_lora_mm(layer.indexer_proj, cur);
+    w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(n_embd_index*n_index_head)));
+    cb(w, "dsv41_idx_w", il);
+
+    // the keys the KV source published, as many rows as the tier exposes this ubatch
+    ggml_tensor * k = lid_ctx->get_k(ctx0, il_keys);
+    const int64_t n_kv = tier.kq_mask->ne[0];
+    GGML_ASSERT(n_kv > 0);
+    GGML_ASSERT(n_kv <= k->ne[2]);
+    k = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], n_kv, k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    cb(k, "dsv41_idx_k", il);
+
+    const int64_t n_stream = k->ne[3];
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+    w = ggml_view_4d(ctx0, w, w->ne[0], w->ne[1]/n_stream, w->ne[2], n_stream,
+            w->nb[1], w->nb[2]/n_stream, w->nb[3]/n_stream, 0);
+
+    // the tier mask already holds -inf on every row the query has not passed (n_visible = (pos+1)/ratio), which is the
+    // reference's compress_lens mask (model.py:561-566). It is F16 under flash attention and F32 otherwise; the fused
+    // indexer wants F16, the unfused add wants the score's F32, and 0/-inf survive either cast exactly.
+    ggml_tensor * mask = tier.kq_mask;
+    ggml_tensor * score = nullptr;
+    if (cparams.fused_lid) {
+        ggml_tensor * mask_f16 = mask->type == GGML_TYPE_F16 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        score = ggml_lightning_indexer(ctx0, q, k, w, mask_f16);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
+
+        score = ggml_relu(ctx0, kq);
+        score = ggml_mul(ctx0, score, w);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        ggml_tensor * mask_f32 = mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32);
+        score = ggml_add(ctx0, score, mask_f32);
+    }
+    cb(score, "dsv41_idx_score", il);
+
+    // two-level selection: the candidate source publishes the block mask and does not apply it to itself; the index
+    // sources after it score only inside the candidate blocks (model.py:569-576)
+    if (dsv41_candidates_enabled(hparams)) {
+        if ((uint32_t) il == hparams.dsv41_candidate_src_layer) {
+            ggml_tensor * mask_f32 = mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32);
+            dsv41_cand_mask = build_dsv41_candidate_mask(score, mask_f32, il);
+        } else if ((uint32_t) il > hparams.dsv41_candidate_src_layer) {
+            GGML_ASSERT(dsv41_cand_mask && "LLAMA_DSV41_TOPK: index source after the candidate source found no candidate mask");
+            GGML_ASSERT(ggml_are_same_shape(dsv41_cand_mask, score) && "LLAMA_DSV41_TOPK: candidate mask from a different compressed tier");
+            score = ggml_add(ctx0, score, dsv41_cand_mask);
+            cb(score, "dsv41_idx_score_cand", il);
+        }
+    }
+
+    // top index_topk rows per query (model.py:578-580); when the tier exposes fewer rows than that, every row is kept and
+    // the selection is the dense path exactly
+    const int64_t n_top_k = std::min<int64_t>(n_kv, hparams.indexer_top_k);
+    GGML_ASSERT(n_top_k > 0);
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, (int) n_top_k));
+    cb(top_k, "dsv41_idx_top_k", il);
+
+    return top_k;
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
@@ -985,6 +1254,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         }
         return off;
     }();
+
+    // LLAMA_DSV41_TOPK=1: V4.1's sparse selection over the compressed stream (see build_dsv41_index_keys). Off by default so
+    // the dense path stays as it is; V4 never takes it.
+    const bool topk_on = v41 && ratio != 0 && inp_dsv4 != nullptr && !compress_off && llama_dsv41_topk_enabled();
+    const llama_kv_cache_dsv4_comp_context * lid_ctx = nullptr;
+    if (topk_on) {
+        // each tier's index keys sit in a cache that mirrors that tier's compressed cache
+        lid_ctx = tier_idx ? inp_dsv4->mctx->get_lid() : inp_dsv4->mctx->get_lid_plain();
+        GGML_ASSERT(lid_ctx && "LLAMA_DSV41_TOPK: no index-key cache for this compressed tier");
+    }
 
     // the pooled compressor serves V4's plain tier, and both of V4.1's
     const bool pooled   = (v41 ? owns_kv : tier_plain) && !(v41 && compress_off);
@@ -1171,6 +1450,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         hca_source_kv = ggml_concat(ctx0, hca_base_kv, hca_state_kv, 1);
         hca_source_score = ggml_concat(ctx0, hca_base_score, hca_state_score, 1);
 
+        // the index keys read the latent before it is rotated, so both forms come out of one pooling pass
+        ggml_tensor * latent_pre = nullptr;
         ggml_tensor * kv_comp_hca = build_hca_compressed_kv_from_state(
                 hca_source_kv,
                 hca_source_score,
@@ -1180,7 +1461,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 tier_ratio,
                 n_embd_head,
                 "comp_state_compress",
-                il);
+                il,
+                topk_on ? &latent_pre : nullptr);
+
+        // written before any indexer of this layer reads the cache: graph order is execution order here, as for the KV rows
+        if (topk_on) {
+            ggml_build_forward_expand(gf, build_dsv41_index_keys(model, inp_dsv4, tier, lid_ctx, latent_pre, il));
+        }
 
         if (tier.k_rot) {
             kv_comp_hca = llama_mul_mat_hadamard(ctx0, kv_comp_hca, tier.k_rot);
@@ -1238,6 +1525,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_build_forward_expand(gf, hca_state_score);
     }
 
+    // V4.1 sparse selection: an index source picks the rows and the layers up to the next index source reuse them.
+    // The picks index the tier's compressed rows, so a tier change (ratio 2 -> 1 at layer 20) must coincide with an index
+    // source, which the model's layer lists guarantee and the assert below checks.
+    ggml_tensor * top_k = nullptr;
+    if (topk_on && tier.kq_mask) {
+        if (hparams.dsv41_is_index_source(il)) {
+            dsv41_top_k       = build_dsv41_indexer_top_k(model, inp_dsv4, tier, lid_ctx, kv_src, qr, cur, inp_pos, il);
+            dsv41_top_k_ratio = ratio;
+        }
+        GGML_ASSERT(dsv41_top_k && "LLAMA_DSV41_TOPK: compressed layer before the first index source");
+        GGML_ASSERT(dsv41_top_k_ratio == ratio && "LLAMA_DSV41_TOPK: reused top-k indexes a different compressed tier");
+        GGML_ASSERT(dsv41_top_k->ne[1] == tier.kq_mask->ne[1] && dsv41_top_k->ne[3] == tier.kq_mask->ne[3]);
+        top_k = dsv41_top_k;
+    }
+
     ggml_tensor * out = nullptr;
     if (inp_mtp) {
         out = build_attn(inp_mtp,
@@ -1255,7 +1557,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     } else if (ratio != 0 && tier.kq_mask && !(v41 && compress_off)) {
         // the compressed rows live on the source layer, which for V4 is this layer itself
         out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), il, kv_src, v41 && tier_idx);
+                1.0f/sqrtf(float(n_embd_head)), il, kv_src, v41 && tier_idx, top_k);
     } else {
         out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), il);

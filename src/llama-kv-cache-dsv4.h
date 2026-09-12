@@ -8,6 +8,12 @@
 #include <unordered_map>
 #include <vector>
 
+// LLAMA_DSV41_TOPK=1 turns on DeepSeek-V4.1's sparse top-k selection over the compressed stream
+// (index keys, indexer scores, shared top-k, candidate blocks). Default off: the dense path stays
+// byte-identical. Read once; the KV cache and the graph builder both key off it, because the
+// plain-tier index-key cache only exists when the selection runs.
+bool llama_dsv41_topk_enabled();
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -145,6 +151,10 @@ public:
     llama_kv_cache      * get_csa() const;
     llama_kv_cache      * get_hca() const;
     llama_kv_cache      * get_lid() const;
+    // V4.1 only, and only under LLAMA_DSV41_TOPK: index keys of the plain-tier (ratio 1) KV source,
+    // one row per compressed row of kv_hca. kv_lid covers the indexed tier (ratio 2) the same way.
+    // nullptr otherwise.
+    llama_kv_cache      * get_lid_plain() const;
     llama_dsv4_comp_state * get_csa_state() const;
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
@@ -168,6 +178,7 @@ private:
     std::unique_ptr<llama_kv_cache>      kv_csa;
     std::unique_ptr<llama_kv_cache>      kv_hca;
     std::unique_ptr<llama_kv_cache>      kv_lid;
+    std::unique_ptr<llama_kv_cache>      kv_lid_plain; // V4.1 + LLAMA_DSV41_TOPK only
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
@@ -363,6 +374,8 @@ public:
     const llama_kv_cache_dsv4_comp_context * get_csa() const;
     const llama_kv_cache_dsv4_comp_context * get_hca() const;
     const llama_kv_cache_dsv4_comp_context * get_lid() const;
+    // nullptr unless the cache was built with a plain-tier index-key cache (see llama_kv_cache_dsv4::get_lid_plain)
+    const llama_kv_cache_dsv4_comp_context * get_lid_plain() const;
     const llama_dsv4_comp_state       * get_csa_state() const;
     const llama_dsv4_comp_state       * get_hca_state() const;
     const llama_dsv4_comp_state       * get_lid_state() const;
@@ -388,10 +401,12 @@ private:
     const llama_memory_context_ptr ctx_csa_mem;
     const llama_memory_context_ptr ctx_hca_mem;
     const llama_memory_context_ptr ctx_lid_mem;
+    const llama_memory_context_ptr ctx_lid_plain_mem; // null when there is no plain-tier index-key cache
 
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_csa;
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_hca;
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_lid;
+    const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_lid_plain; // likewise
 
     llama_dsv4_comp_state * csa_state = nullptr;
     llama_dsv4_comp_state * hca_state = nullptr;
