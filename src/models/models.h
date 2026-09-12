@@ -1353,6 +1353,32 @@ struct llama_model_deepseek4 : public llama_model_base {
         mutable int64_t       dsv41_top_k_ratio = 0;
         mutable ggml_tensor * dsv41_cand_mask   = nullptr;
 
+        // Sparse compute for the selection: instead of masking every compressed row, gather the picked rows (and the window)
+        // into a compact K/V and attend over those. Taken when the ubatch is small (decode); prefill keeps the mask path.
+        // The index source publishes the 0/-inf validity of its picks alongside them; the window row ids are built once per graph.
+        mutable bool          dsv41_sparse   = false;
+        mutable ggml_tensor * dsv41_sel_mask = nullptr; // F32 [n_top_k, n_tokens/n_stream, 1, n_stream]
+        mutable ggml_tensor * dsv41_raw_ids  = nullptr; // I32 [n_raw]
+
+        // mask_f32 is the tier's visibility mask; returns, per picked row, that row's mask entry.
+        ggml_tensor * build_dsv41_sel_mask(
+                ggml_tensor * mask_f32,
+                ggml_tensor * top_k,
+                int il) const;
+
+        // q [n_embd_head, n_head, n_tokens]; raw_k/comp_k are the cache views [n_embd_head, 1, n_rows, n_stream];
+        // raw_mask [n_raw, n_tokens/n_stream, 1, n_stream]; top_k I32 and sel_mask F32 [n_top_k, n_tokens/n_stream, 1, n_stream].
+        ggml_tensor * build_dsv41_sparse_attention(
+                ggml_tensor * q,
+                ggml_tensor * raw_k,
+                ggml_tensor * raw_mask,
+                ggml_tensor * comp_k,
+                ggml_tensor * top_k,
+                ggml_tensor * sel_mask,
+                ggml_tensor * sinks,
+                float kq_scale,
+                int il) const;
+
         ggml_tensor * build_raw_attention(
                 llm_graph_input_dsv4_raw * inp_attn,
                 ggml_tensor * q,

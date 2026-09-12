@@ -827,6 +827,20 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     GGML_ASSERT(n_hca > 0);
     GGML_ASSERT(n_hca <= hca_k->ne[2]);
 
+    // V4.1 sparse compute: gather the picked rows and attend over those alone (see build_dsv41_sparse_attention)
+    if (top_k && dsv41_sparse) {
+        GGML_ASSERT(dsv41_sel_mask && "sparse selection without the picks' validity mask");
+
+        ggml_tensor * out = build_dsv41_sparse_attention(q, raw_k, inp_attn->get_kq_mask(), hca_k,
+                top_k, dsv41_sel_mask, sinks, kq_scale, il);
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
+        cb(out, "attn_hca_sparse", il);
+
+        return out;
+    }
+
     hca_k = ggml_view_4d(ctx0, hca_k,
             hca_k->ne[0], hca_k->ne[1], n_hca, hca_k->ne[3],
             hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
@@ -1109,7 +1123,151 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_indexer_top_k(
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, (int) n_top_k));
     cb(top_k, "dsv41_idx_top_k", il);
 
+    // the gather path needs to know which picks are real rows: the same 0/-inf the mask path would add, read at the picks
+    if (dsv41_sparse) {
+        ggml_tensor * mask_f32 = mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32);
+        dsv41_sel_mask = build_dsv41_sel_mask(mask_f32, top_k, il);
+    }
+
     return top_k;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sel_mask(
+        ggml_tensor * mask_f32,
+        ggml_tensor * top_k,
+        int il) const {
+    const int64_t n_kv     = mask_f32->ne[0];
+    const int64_t nt       = mask_f32->ne[1];
+    const int64_t n_stream = mask_f32->ne[3];
+    const int64_t n_sel    = top_k->ne[0];
+
+    GGML_ASSERT(mask_f32->type == GGML_TYPE_F32 && ggml_is_contiguous(mask_f32));
+    GGML_ASSERT(mask_f32->ne[2] == 1);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && ggml_is_contiguous(top_k));
+    GGML_ASSERT(top_k->ne[1] == nt && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
+
+    // get_rows gathers rows, and the CUDA kernel wants rows of an even width, so each mask entry is doubled into a 2-wide
+    // row first; per stream the gather is batched over the tokens (a->ne[2] == b->ne[1]) and column 0 is kept
+    ggml_tensor * m2 = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, mask_f32, 1, n_kv, nt, n_stream), 2, n_kv, nt, n_stream);
+
+    ggml_tensor * res = nullptr;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        ggml_tensor * a = ggml_view_3d(ctx0, m2, 2, n_kv, nt, m2->nb[1], m2->nb[2], s*m2->nb[3]);
+        ggml_tensor * b = ggml_view_2d(ctx0, top_k, n_sel, nt, top_k->nb[1], s*top_k->nb[3]);
+
+        ggml_tensor * g = ggml_get_rows(ctx0, a, b); // F32 [2, n_sel, nt]
+        g = ggml_cont(ctx0, ggml_view_3d(ctx0, g, 1, n_sel, nt, g->nb[1], g->nb[2], 0));
+
+        res = res ? ggml_concat(ctx0, res, g, 3) : g;
+    }
+
+    res = ggml_reshape_4d(ctx0, res, n_sel, nt, 1, n_stream);
+    cb(res, "dsv41_sel_mask", il);
+
+    return res;
+}
+
+// Sparse compute for V4.1's selection. The mask path hands flash attention every compressed row and lets -inf do the
+// selecting, so decode time grows with the context. Here the picked rows are gathered into a compact K (which is also V)
+// of n_raw window rows plus n_top_k picks per query, and attention runs over those alone.
+//
+// Layout: each query gets its own K, so the tokens are folded into the batch dimension that build_attn_mha() already
+// splits streams over: K is [n_embd_head, 1, n_kv_sel, n_tokens/n_stream * n_stream] with batch b = t + T*s, which is the
+// order the queries have in q (a stream's tokens are contiguous). The window rows are shared by a stream's tokens and
+// repeated; the picks are gathered per token with the stream's row ids, so no global ids are needed and multi-stream
+// caches work unchanged. Rows come out of get_rows as F32 and build_attn_mha() casts them to F16 under flash attention.
+//
+// Equivalence: same picks, same validity (the tier mask read at the picks), same window and mask, same scale and sinks;
+// masked and padding rows contribute nothing. Padding to FATTN_KQ_STRIDE keeps the D=512 flash-attention kernels eligible.
+// Not bit-exact against the mask path on a quantized cache: the picks are dequantized once here, the mask path lets the
+// kernel dequantize; with an F16 cache the rows are identical and only the kernel's tiling differs.
+ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sparse_attention(
+        ggml_tensor * q,
+        ggml_tensor * raw_k,
+        ggml_tensor * raw_mask,
+        ggml_tensor * comp_k,
+        ggml_tensor * top_k,
+        ggml_tensor * sel_mask,
+        ggml_tensor * sinks,
+        float kq_scale,
+        int il) const {
+    const int64_t n_embd_head = raw_k->ne[0];
+    const int64_t n_raw       = raw_k->ne[2];
+    const int64_t n_stream    = raw_k->ne[3];
+    const int64_t n_sel       = top_k->ne[0];
+    const int64_t nt          = top_k->ne[1];       // tokens per stream
+    const int64_t n_batch     = nt*n_stream;
+
+    GGML_ASSERT(raw_k->ne[1] == 1 && comp_k->ne[1] == 1);
+    GGML_ASSERT(comp_k->ne[0] == n_embd_head && comp_k->ne[3] == n_stream);
+    GGML_ASSERT(q->ne[0] == n_embd_head && q->ne[2] == n_batch);
+    GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == nt && raw_mask->ne[2] == 1 && raw_mask->ne[3] == n_stream);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && ggml_is_contiguous(top_k) && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
+    GGML_ASSERT(sel_mask->type == GGML_TYPE_F32 && ggml_is_contiguous(sel_mask));
+    GGML_ASSERT(sel_mask->ne[0] == n_sel && sel_mask->ne[1] == nt && sel_mask->ne[2] == 1 && sel_mask->ne[3] == n_stream);
+
+    // every window row of a stream, in order: identity ids, built once per graph (argsort of an arange stays I32 end to end)
+    if (dsv41_raw_ids == nullptr || dsv41_raw_ids->ne[0] != n_raw) {
+        dsv41_raw_ids = ggml_argsort(ctx0, ggml_arange(ctx0, 0.0f, (float) n_raw, 1.0f), GGML_SORT_ORDER_ASC);
+        cb(dsv41_raw_ids, "dsv41_raw_ids", -1);
+    }
+
+    ggml_tensor * k_all = nullptr;
+    ggml_tensor * m_all = nullptr;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        // window rows, dequantized, then one copy per token of the stream: [n_embd_head, n_raw, nt]
+        ggml_tensor * kr_s = ggml_view_2d(ctx0, raw_k, n_embd_head, n_raw, raw_k->nb[2], s*raw_k->nb[3]);
+        ggml_tensor * r_s  = ggml_get_rows(ctx0, kr_s, dsv41_raw_ids);
+        r_s = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, r_s, n_embd_head*n_raw, 1), n_embd_head*n_raw, nt, 1, 1);
+        r_s = ggml_reshape_3d(ctx0, r_s, n_embd_head, n_raw, nt);
+
+        // the picks, per token: [n_embd_head, n_sel, nt]
+        ggml_tensor * kc_s  = ggml_view_2d(ctx0, comp_k, n_embd_head, comp_k->ne[2], comp_k->nb[2], s*comp_k->nb[3]);
+        ggml_tensor * idx_s = ggml_view_1d(ctx0, top_k, n_sel*nt, s*top_k->nb[3]);
+        ggml_tensor * g_s   = ggml_get_rows(ctx0, kc_s, idx_s);
+        g_s = ggml_reshape_3d(ctx0, g_s, n_embd_head, n_sel, nt);
+
+        ggml_tensor * k_s = ggml_concat(ctx0, r_s, g_s, 1);
+
+        // the matching mask columns: the window's per-token mask, then the picks' validity
+        ggml_tensor * rm_s = ggml_cast(ctx0,
+                ggml_view_2d(ctx0, raw_mask, n_raw, nt, raw_mask->nb[1], s*raw_mask->nb[3]), GGML_TYPE_F32);
+        ggml_tensor * sm_s = ggml_cont(ctx0,
+                ggml_view_2d(ctx0, sel_mask, n_sel, nt, sel_mask->nb[1], s*sel_mask->nb[3]));
+        ggml_tensor * m_s = ggml_concat(ctx0, rm_s, sm_s, 0);
+
+        k_all = k_all ? ggml_concat(ctx0, k_all, k_s, 3) : k_s;
+        m_all = m_all ? ggml_concat(ctx0, m_all, m_s, 3) : m_s;
+    }
+
+    // [n_embd_head, n_kv_sel, nt, n_stream] -> one K per query, batch b = t + nt*s
+    int64_t n_kv_sel = n_raw + n_sel;
+    k_all = ggml_reshape_4d(ctx0, k_all, n_embd_head, 1, n_kv_sel, n_batch);
+    m_all = ggml_reshape_4d(ctx0, m_all, n_kv_sel, 1, 1, n_batch);
+
+    // the CUDA flash-attention kernels for D=512 want the row count a multiple of FATTN_KQ_STRIDE (256); pad with zero rows
+    // that the mask removes
+    const int64_t n_kv_pad = GGML_PAD(n_kv_sel, 256);
+    if (n_kv_pad != n_kv_sel) {
+        const int64_t n_pad = n_kv_pad - n_kv_sel;
+        k_all = ggml_concat(ctx0, k_all,
+                ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd_head, 1, n_pad, n_batch), 0.0f), 2);
+        m_all = ggml_concat(ctx0, m_all,
+                ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pad, 1, 1, n_batch), -INFINITY), 0);
+        n_kv_sel = n_kv_pad;
+    }
+    // flash attention takes F16 rows and an F16 mask; cast K once here rather than letting build_attn_mha() cast K and V
+    // separately, since they are the same tensor
+    if (cparams.flash_attn) {
+        k_all = ggml_cast(ctx0, k_all, GGML_TYPE_F16);
+        m_all = ggml_cast(ctx0, m_all, GGML_TYPE_F16);
+    }
+    cb(k_all, "dsv41_sparse_k", il);
+    cb(m_all, "dsv41_sparse_mask", il);
+
+    // build_attn_mha() splits q over k_all->ne[3] = n_batch, so each query meets only its own rows; K doubles as V
+    return build_attn_mha(q, k_all, k_all, nullptr, m_all, sinks, nullptr, kq_scale, il);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
@@ -1268,6 +1426,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     // the dense path stays as it is; V4 never takes it.
     const bool topk_on = v41 && ratio != 0 && inp_dsv4 != nullptr && !compress_off && llama_dsv41_topk_enabled();
     const llama_kv_cache_dsv4_comp_context * lid_ctx = nullptr;
+
+    // Sparse compute (gather) up to this many tokens per ubatch; larger ubatches (prefill) keep the mask path, because the
+    // gather materializes n_top_k rows per token (512 x 512 x 4 B = 1 MiB per token per layer, plus the F16 copy).
+    // LLAMA_DSV41_SPARSE_MAX_TOKENS overrides; 0 keeps the mask path everywhere.
+    static const int64_t sparse_max_tokens = [] {
+        const char * e = getenv("LLAMA_DSV41_SPARSE_MAX_TOKENS");
+        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 32;
+    }();
+    dsv41_sparse = topk_on && nt <= sparse_max_tokens;
+
     if (topk_on) {
         // each tier's index keys sit in a cache that mirrors that tier's compressed cache
         lid_ctx = tier_idx ? inp_dsv4->mctx->get_lid() : inp_dsv4->mctx->get_lid_plain();
