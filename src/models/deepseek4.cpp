@@ -3,8 +3,12 @@
 
 #include "llama-kv-cache-dsv4.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -880,8 +884,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
-    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il);
+        int il,
+        ggml_tensor * cur_comp) const {
+    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, cur_comp);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_attention(
@@ -899,8 +904,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         llm_graph_input_attn_k_iswa * inp_mtp,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
+        int il,
+        ggml_tensor * cur_comp) const {
     GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
+
+    // the compressor's input; only the decoder skip hands in something other than cur (the whole ubatch, where cur is its tail)
+    ggml_tensor * cur_comp_in = cur_comp ? cur_comp : cur;
 
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4 ? inp_dsv4->get_raw() : nullptr;
@@ -997,13 +1006,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     ggml_tensor * hca_source_kv   = nullptr;
     ggml_tensor * hca_source_score = nullptr;
     if (pooled && tier.state_pos) {
-        hca_state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
+        hca_state_kv = build_lora_mm(layer.attn_comp_wkv, cur_comp_in);
         cb(hca_state_kv, "comp_state_kv", il);
 
         // A ratio 1 tier pools one token, so its softmax is the identity and any score gives weight 1.
         // V4.1's ratio 1 source layer ships no gate at all, hence the zeros.
         hca_state_score = layer.attn_comp_wgate
-            ? build_lora_mm(layer.attn_comp_wgate, cur)
+            ? build_lora_mm(layer.attn_comp_wgate, cur_comp_in)
             : ggml_scale(ctx0, hca_state_kv, 0.0f);
         cb(hca_state_score, "comp_state_score", il);
 
@@ -1280,16 +1289,397 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     return out;
 }
 
+//
+// V4.1 decoder skip (LLAMA_DSV41_DECODER_SKIP=1)
+//
+// V4.1 is a causal encoder-decoder: the encoder half compresses the prompt, and the decoder half reads one
+// compressed KV that its first layer (the ratio 1 source) computes from the encoder output. DeepSeek's prefill
+// runs only the encoder over the prompt; the decoder's own sliding-window cache for the prompt is filled by a
+// "bounded replay" of just the last window of tokens, and the tech report calls that an approximation.
+//
+// This does the same inside one graph. A prompt ubatch (n_tokens > n_swa) runs the encoder over every token,
+// lets the source layer write its compressed rows for every token, and then cuts everything per token - the
+// hyper-connection stream, the carried mix coefficients, positions, raw-cache write idxs and mask rows - to the
+// last n_swa tokens for the rest of the loop. Decoder K rows are written for those tokens only, and the mask
+// for them drops this ubatch's earlier cells, which the decoder never writes. The next token attends to at most
+// the n_swa - 1 tokens before it, so its window is covered.
+//
+// Ubatch boundaries: each prompt ubatch replays its own tail, so after the last one the decoder's window cache
+// holds the tail of that ubatch plus the tail of the one before, which is what the first generated token needs.
+// A tail token can only ever see cells of tokens that were in the tail of their ubatch (or in a ubatch small
+// enough to run the full graph), so no unwritten row is ever read. Where the full graph would have let an early
+// tail token see the encoder-only tokens before it, it now sees the compressed rows only - that is the
+// approximation, and it mirrors the reference replay.
+//
+// Off by default; when off the graph is what it was. A decode ubatch (n_tokens <= n_swa) is never touched.
+// Requests that want rows for tokens the decoder no longer sees - embeddings, all-token logits, layer-input
+// taps past the source layer, unmasked next-n hidden states - take the full graph for that ubatch.
+
+static bool dsv41_decoder_skip_env() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_DSV41_DECODER_SKIP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+struct dsv41_decoder_skip {
+    bool    engaged = false;
+    int     il_dec  = -1; // the decoder's KV source layer, where the narrowing happens
+    int64_t n_tail  = 0;  // tokens the decoder half runs over
+};
+
+// The decoder's single KV source: a ratio 1 source layer with every layer after it at ratio 1 and reading its rows.
+// Anything else is not the shape this optimisation is written for.
+static int dsv41_decoder_source_layer(const llama_hparams & hparams) {
+    if (hparams.dsv41_n_kv_source == 0 || hparams.dsv4_ratio_plain != 1) {
+        return -1;
+    }
+
+    const uint32_t n_layer = hparams.n_layer();
+
+    int il_dec = -1;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (hparams.dsv4_compress_ratios[il] == 1 && hparams.dsv41_is_kv_source(il)) {
+            il_dec = (int) il;
+            break;
+        }
+    }
+    if (il_dec < 0) {
+        return -1;
+    }
+
+    for (uint32_t il = il_dec; il < n_layer; ++il) {
+        if (hparams.dsv4_compress_ratios[il] != 1 || hparams.dsv41_kv_source_for(il) != il_dec) {
+            return -1;
+        }
+    }
+
+    return il_dec;
+}
+
+// Whether this ubatch takes the narrowed graph. Evaluated from the graph params so the reuse check can ask the same question.
+static dsv41_decoder_skip dsv41_plan_decoder_skip(const llm_graph_params & params) {
+    dsv41_decoder_skip res;
+
+    if (!dsv41_decoder_skip_env() || params.arch != LLM_ARCH_DEEPSEEK41) {
+        return res;
+    }
+
+    const auto & hparams = params.hparams;
+    const auto & cparams = params.cparams;
+    const auto & ubatch  = params.ubatch;
+
+    const int64_t n_swa    = hparams.n_swa;
+    const int64_t n_tokens = ubatch.n_tokens;
+
+    // a decode ubatch keeps the full graph
+    if (n_swa <= 0 || n_tokens <= n_swa) {
+        return res;
+    }
+
+    const int il_dec = dsv41_decoder_source_layer(hparams);
+    if (il_dec < 0) {
+        return res;
+    }
+
+    // everything that wants rows for tokens the decoder would no longer see
+    if (!cparams.causal_attn || cparams.embeddings) {
+        return res;
+    }
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+        return res;
+    }
+    for (size_t il = (size_t) il_dec + 1; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (cparams.embeddings_layer_inp[il]) {
+            return res;
+        }
+    }
+
+    // one sequence in position order, with the raw cache writing exactly this ubatch, so the tail is the last n_swa positions
+    if (ubatch.n_seqs_unq != 1 || ubatch.n_pos != 1 || ubatch.pos == nullptr || ubatch.n_seq_id == nullptr) {
+        return res;
+    }
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.pos[i] != ubatch.pos[0] + i) {
+            return res;
+        }
+    }
+
+    const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
+    if (mctx == nullptr || mctx->get_raw() == nullptr) {
+        return res;
+    }
+    if (mctx->get_raw()->get_n_write() != (uint32_t) n_tokens) {
+        return res;
+    }
+    if (mctx->get_csa_plan(ubatch).n_stream != 1) {
+        return res;
+    }
+
+    // the outputs asked for have to be tail tokens; a prompt chunk asks for none, or for the last one
+    const int64_t head = n_tokens - n_swa;
+    if (params.n_outputs > 0) {
+        if (ubatch.output == nullptr) {
+            return res;
+        }
+        int64_t n_tail_out = 0;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            if (!ubatch.output[i]) {
+                continue;
+            }
+            if (i < head) {
+                return res;
+            }
+            ++n_tail_out;
+        }
+        if (n_tail_out != (int64_t) params.n_outputs) {
+            return res;
+        }
+    }
+
+    res.engaged = true;
+    res.il_dec  = il_dec;
+    res.n_tail  = n_swa;
+
+    return res;
+}
+
+// The last n_tail tokens of a per-token tensor. Tokens are the outermost dimension and the trailing rows of a
+// contiguous tensor are contiguous themselves, so these stay views.
+static ggml_tensor * dsv41_tail_2d(ggml_context * ctx, ggml_tensor * t, int64_t n_tail) {
+    GGML_ASSERT(ggml_is_contiguous(t));
+    GGML_ASSERT(t->ne[2] == 1 && t->ne[3] == 1);
+    GGML_ASSERT(t->ne[1] >= n_tail);
+
+    return ggml_view_2d(ctx, t, t->ne[0], n_tail, t->nb[1], (t->ne[1] - n_tail)*t->nb[1]);
+}
+
+static ggml_tensor * dsv41_tail_3d(ggml_context * ctx, ggml_tensor * t, int64_t n_tail) {
+    GGML_ASSERT(ggml_is_contiguous(t));
+    GGML_ASSERT(t->ne[3] == 1);
+    GGML_ASSERT(t->ne[2] >= n_tail);
+
+    return ggml_view_3d(ctx, t, t->ne[0], t->ne[1], n_tail, t->nb[1], t->nb[2], (t->ne[2] - n_tail)*t->nb[2]);
+}
+
+// The last n_tail query rows of a one-stream kq mask [n_kv, n_tokens, 1, 1]. The strides of the unit dims are set so the view is contiguous, which flash attention requires.
+static ggml_tensor * dsv41_tail_mask(ggml_context * ctx, ggml_tensor * m, int64_t n_tail) {
+    GGML_ASSERT(m->ne[2] == 1 && m->ne[3] == 1);
+    GGML_ASSERT(m->ne[1] >= n_tail);
+
+    const size_t nb1 = m->nb[1];
+
+    return ggml_view_4d(ctx, m, m->ne[0], n_tail, 1, 1, nb1, nb1*n_tail, nb1*n_tail, (m->ne[1] - n_tail)*nb1);
+}
+
+// The per-ubatch inputs the narrowed graph needs beyond views: the out ids shifted into the tail, and the decoder's raw mask rows.
+class llm_graph_input_dsv41_tail : public llm_graph_input_i {
+public:
+    llm_graph_input_dsv41_tail(const dsv41_decoder_skip & skip, uint32_t n_outputs) : skip(skip), n_outputs(n_outputs) {}
+    virtual ~llm_graph_input_dsv41_tail() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    dsv41_decoder_skip skip;
+
+    const uint32_t n_outputs;
+
+    // the ubatch-wide raw inputs; registered before this one, so already set when this runs
+    const llm_graph_input_dsv4_raw * inp_raw = nullptr;
+
+    ggml_tensor * out_ids = nullptr; // I32 [n_outputs]: the ubatch out ids minus the head, indexing the tail
+    ggml_tensor * kq_mask = nullptr; // F32/F16 [n_kv, n_tail, 1, 1]: the tail rows of the raw mask, with this ubatch's head cells masked out
+};
+
+void llm_graph_input_dsv41_tail::set_input(const llama_ubatch * ubatch) {
+    if (!skip.engaged) {
+        return;
+    }
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_tail   = skip.n_tail;
+    const int64_t head     = n_tokens - n_tail;
+
+    GGML_ASSERT(head >= 0);
+
+    if (out_ids) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
+        GGML_ASSERT(ubatch->output);
+
+        int32_t * data = (int32_t *) out_ids->data;
+
+        int64_t n = 0;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            if (!ubatch->output[i]) {
+                continue;
+            }
+            GGML_ASSERT(i >= head && "deepseek41 decoder skip: an output token is outside the tail");
+            GGML_ASSERT(n < (int64_t) n_outputs);
+            data[n++] = (int32_t) (i - head);
+        }
+        GGML_ASSERT(n == (int64_t) n_outputs);
+    }
+
+    if (kq_mask) {
+        GGML_ASSERT(inp_raw && inp_raw->self_kq_mask && inp_raw->self_k_idxs && inp_raw->mctx);
+
+        const ggml_tensor * src  = inp_raw->self_kq_mask;
+        const ggml_tensor * idxs = inp_raw->self_k_idxs;
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(src->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(idxs->buffer));
+        GGML_ASSERT(src->type == kq_mask->type);
+        GGML_ASSERT(src->ne[0] == kq_mask->ne[0]);
+        GGML_ASSERT(src->ne[1] == n_tokens && src->ne[2] == 1 && src->ne[3] == 1);
+        GGML_ASSERT(kq_mask->ne[1] == n_tail);
+        GGML_ASSERT(idxs->ne[0] == n_tokens);
+
+        const int64_t n_kv = kq_mask->ne[0];
+        const size_t  esz  = ggml_element_size(kq_mask);
+
+        // the tail rows as the sliding window computed them
+        memcpy(kq_mask->data, (const char *) src->data + head*src->nb[1], (size_t) n_tail*n_kv*esz);
+
+        // then drop this ubatch's head cells: they sit inside the window of the first tail tokens, and no decoder layer writes them.
+        // the idxs are global rows, stream*size + cell, and the mask columns are cells of the one stream this ubatch is on.
+        const int64_t * kidx    = (const int64_t *) idxs->data;
+        const int64_t   kv_size = inp_raw->mctx->get_size();
+
+        GGML_ASSERT(kv_size > 0);
+
+        const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
+
+        for (int64_t i = 0; i < head; ++i) {
+            const int64_t col = kidx[i] % kv_size;
+            if (col >= n_kv) {
+                continue;
+            }
+            for (int64_t r = 0; r < n_tail; ++r) {
+                if (kq_mask->type == GGML_TYPE_F16) {
+                    ((ggml_fp16_t *) kq_mask->data)[r*n_kv + col] = f16_ninf;
+                } else {
+                    ((float *) kq_mask->data)[r*n_kv + col] = -INFINITY;
+                }
+            }
+        }
+    }
+}
+
+bool llm_graph_input_dsv41_tail::can_reuse(const llm_graph_params & params) {
+    // a graph narrowed for one ubatch must not serve one that has an output outside the tail, and a full graph should not keep serving ubatches that could be narrowed
+    const dsv41_decoder_skip next = dsv41_plan_decoder_skip(params);
+
+    bool res = true;
+    res &= next.engaged == skip.engaged;
+    res &= next.il_dec  == skip.il_dec;
+    res &= next.n_tail  == skip.n_tail;
+
+    if (!skip.engaged) {
+        return res;
+    }
+
+    res &= (out_ids ? out_ids->ne[0] : 0) == (int64_t) params.n_outputs;
+
+    const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
+    res &= kq_mask != nullptr && mctx != nullptr && mctx->get_raw() != nullptr;
+    if (res) {
+        res &= kq_mask->ne[0] == (int64_t) mctx->get_raw()->get_n_kv();
+    }
+
+    return res;
+}
+
+// A dsv4 input object whose per-token tensors are tail views of the registered one's. It is never registered, so nothing sets it; the views read the buffers of the real inputs.
+// The compressor-state tensors are shared as they are: after the source layer no layer runs the compressor.
+static std::unique_ptr<llm_graph_input_dsv4> dsv41_build_tail_inputs(
+        ggml_context * ctx,
+        const llm_graph_input_dsv4 * inp,
+        ggml_tensor * raw_kq_mask_tail,
+        int64_t n_tail) {
+    const llm_graph_input_dsv4_raw * raw = inp->get_raw();
+
+    GGML_ASSERT(raw && raw->self_k_idxs && raw_kq_mask_tail);
+
+    const int64_t n_tokens = raw->self_k_idxs->ne[0];
+    const int64_t head     = n_tokens - n_tail;
+
+    GGML_ASSERT(head >= 0);
+
+    auto raw_tail = std::make_unique<llm_graph_input_dsv4_raw>(*raw);
+    raw_tail->self_k_idxs      = ggml_view_1d(ctx, raw->self_k_idxs, n_tail, head*ggml_element_size(raw->self_k_idxs));
+    raw_tail->self_kq_mask     = raw_kq_mask_tail;
+    raw_tail->self_kq_mask_cnv = raw_kq_mask_tail;
+
+    auto res = std::make_unique<llm_graph_input_dsv4>(inp->cparams, std::move(raw_tail), inp->mctx);
+    res->inp_csa = inp->inp_csa;
+    res->inp_hca = inp->inp_hca;
+    res->inp_lid = inp->inp_lid;
+
+    for (auto * ci : { &res->inp_csa, &res->inp_hca, &res->inp_lid }) {
+        if (ci->kq_mask) {
+            ci->kq_mask = dsv41_tail_mask(ctx, ci->kq_mask, n_tail);
+        }
+    }
+
+    return res;
+}
+
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
     ggml_tensor * cur;
 
+    // decided before any input is built, because it picks which out-ids input the graph gets
+    const dsv41_decoder_skip skip = dsv41_plan_decoder_skip(params);
+
+    std::unique_ptr<llm_graph_input_dsv41_tail> tail_inp;
+    if (dsv41_decoder_skip_env() && arch == LLM_ARCH_DEEPSEEK41) {
+        // registered even when not engaged, so the reuse check re-asks the question for the next ubatch
+        tail_inp = std::make_unique<llm_graph_input_dsv41_tail>(skip, (uint32_t) n_outputs);
+    }
+    if (skip.engaged) {
+        static bool logged = false;
+        if (!logged) {
+            LLAMA_LOG_INFO("deepseek41: LLAMA_DSV41_DECODER_SKIP=1, prompt ubatches run layers %d-%d over their last %d tokens only\n",
+                    skip.il_dec, (int) n_layer - 1, (int) skip.n_tail);
+            logged = true;
+        }
+    }
+
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * inp_out_ids = nullptr;
+    if (skip.engaged && n_outputs > 0) {
+        // the out ids index the narrowed stream; the ubatch-wide input is not built, since an input nothing reads has no buffer and aborts when set
+        tail_inp->out_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+        ggml_set_input(tail_inp->out_ids);
+        ggml_set_name(tail_inp->out_ids, "dsv41_tail_out_ids");
+        inp_out_ids = tail_inp->out_ids;
+    } else {
+        inp_out_ids = build_inp_out_ids();
+    }
+
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
+
+    // the tail input copies from the raw idxs and mask the dsv4 input sets, so it is registered after it
+    llm_graph_input_dsv41_tail * inp_tail = nullptr;
+    if (tail_inp) {
+        tail_inp->inp_raw = inp_attn;
+        if (skip.engaged) {
+            GGML_ASSERT(inp_attn->self_kq_mask->ne[3] == 1);
+            tail_inp->kq_mask = ggml_new_tensor_4d(ctx0, inp_attn->self_kq_mask->type, inp_attn->self_kq_mask->ne[0], skip.n_tail, 1, 1);
+            ggml_set_input(tail_inp->kq_mask);
+            ggml_set_name(tail_inp->kq_mask, "dsv41_tail_kq_mask");
+            ggml_build_forward_expand(gf, tail_inp->kq_mask);
+        }
+        inp_tail = (llm_graph_input_dsv41_tail *) res->add_input(std::move(tail_inp));
+    }
 
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
@@ -1319,6 +1709,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_build_forward_expand(gf, inp_engram);
     }
 
+    // the per-token inputs the loop reads; the decoder skip swaps these for tail views at its source layer
+    ggml_tensor * inp_pos_cur    = inp_pos;
+    ggml_tensor * inp_tokens_cur = res->t_inp_tokens;
+    ggml_tensor * inp_engram_cur = inp_engram;
+    llm_graph_input_dsv4 * inp_dsv4_cur = inp_dsv4;
+    std::unique_ptr<llm_graph_input_dsv4> inp_dsv4_tail;
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
@@ -1331,7 +1728,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
         // the engram writes into the residual before the block body, so the whole layer sees it.
         if (!engram_off && model.layers[il].engram_embed) {
-            inpL = build_engram(model, inpL, inp_engram, il);
+            inpL = build_engram(model, inpL, inp_engram_cur, il);
             cb(inpL, "engram_out", il);
         }
 
@@ -1355,7 +1752,42 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
+        ggml_tensor * cur_comp = nullptr;
+        if (skip.engaged && il == skip.il_dec) {
+            // The decoder's KV source. Its compressed rows for every token come from cur as it stands here - the
+            // encoder output, normalized - so the compressor keeps the whole ubatch (cur_comp). Everything else per
+            // token is cut to the tail from here on: this layer's own attention and FFN, and every layer after it.
+            const int64_t n_tail = skip.n_tail;
+            const int64_t head   = n_tokens - n_tail;
+
+            cur_comp = cur;
+            cur      = dsv41_tail_2d(ctx0, cur,      n_tail);
+            residual = dsv41_tail_3d(ctx0, residual, n_tail);
+            post     = dsv41_tail_2d(ctx0, post,     n_tail);
+            comb     = dsv41_tail_3d(ctx0, comb,     n_tail);
+            attn_pre = dsv41_tail_2d(ctx0, attn_pre, n_tail);
+            inpL     = residual;
+            cb(cur, "dsv41_tail_attn_norm", il);
+
+            GGML_ASSERT(inp_pos->ne[0] == n_tokens);
+            inp_pos_cur = ggml_view_1d(ctx0, inp_pos, n_tail, head*ggml_element_size(inp_pos));
+            if (inp_tokens_cur) {
+                GGML_ASSERT(inp_tokens_cur->ne[0] == n_tokens);
+                inp_tokens_cur = ggml_view_1d(ctx0, inp_tokens_cur, n_tail, head*ggml_element_size(inp_tokens_cur));
+            }
+            if (inp_engram_cur) {
+                // [n_cols*n_tokens, n_eng]: the tail of every table's run of rows
+                const int64_t n_cols = hparams.engram_n_hash_cols();
+                inp_engram_cur = ggml_view_2d(ctx0, inp_engram, n_cols*n_tail, inp_engram->ne[1], inp_engram->nb[1],
+                        head*n_cols*ggml_element_size(inp_engram));
+            }
+
+            GGML_ASSERT(inp_tail && inp_tail->kq_mask);
+            inp_dsv4_tail = dsv41_build_tail_inputs(ctx0, inp_dsv4, inp_tail->kq_mask, n_tail);
+            inp_dsv4_cur  = inp_dsv4_tail.get();
+        }
+
+        cur = build_attention(model, inp_dsv4_cur, cur, inp_pos_cur, il, cur_comp);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
@@ -1382,7 +1814,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
         if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
-            selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
+            selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, inp_tokens_cur);
             exp_probs_b = nullptr;
         }
 
@@ -1426,7 +1858,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         // expanded by set_outputs, see the per-layer taps above
     }
 
-    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+    // the stream is n_tokens wide, or n_tail wide after the decoder skip; the out ids index whichever it is
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, inpL->ne[2]);
     ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
 
     if (cparams.embeddings_nextn) {

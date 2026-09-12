@@ -1220,12 +1220,14 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
 
+        // cur_comp is what the compressor projects when it differs from what attention reads: the V4.1 decoder skip keeps the whole ubatch for the source layer's compressed rows while its attention runs on the tail. Null means cur.
         ggml_tensor * build_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                ggml_tensor * cur_comp = nullptr) const;
 
         ggml_tensor * build_attention(
                 const llama_model & model,
@@ -1240,7 +1242,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 llm_graph_input_attn_k_iswa * inp_mtp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                ggml_tensor * cur_comp = nullptr) const;
 
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,

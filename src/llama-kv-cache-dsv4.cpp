@@ -1937,6 +1937,10 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     return ubatches_write[i_next].n_tokens;
 }
 
+uint32_t llama_kv_cache_dsv4_raw_context::get_size() const {
+    return kv_swa->get_size();
+}
+
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv_swa->get_k(ctx, il, n_kv, sinfos_read[i_next]);
 }

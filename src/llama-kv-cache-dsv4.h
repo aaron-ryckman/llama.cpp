@@ -205,6 +205,9 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_write() const;
 
+    // cells per stream of the sliding-window cache. The k idxs are global row ids (stream*size + cell) while the mask columns are cells, so this is what turns one into the other.
+    uint32_t get_size() const;
+
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
