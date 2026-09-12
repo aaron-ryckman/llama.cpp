@@ -4288,6 +4288,185 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // DeepSeek V4.1 tests - same DSML markup and bare-</think> generation prompt as V4, but the
+    // tag names carry a leading space (it is part of the tag):
+    //   <｜DSML｜ calls>
+    //   <｜DSML｜ invoke name="foo">
+    //   <｜DSML｜ parameter name="bar" string="true|false">value</｜DSML｜ parameter>
+    //   </｜DSML｜ invoke>
+    //   </｜DSML｜ calls>
+    {
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja", detailed_debug);
+
+        // Pure content (non-thinking mode; generation prompt ends with </think>)
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        // Thinking + content
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Thinking + tool call (single, string param)
+        tst.test(
+               "Let me check the time</think>\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check the time"))
+            .run();
+
+        // Tool call without reasoning (non-thinking mode), integer param (string="false")
+        tst.test(
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"special_function\">\n"
+               "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // The "\n\n" separator belongs to the tool call block, not assistant content.
+        tst.test(
+               "\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"special_function\">\n"
+               "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .expect_reconstruction()
+            .run();
+
+        // Multiple parallel tool calls with reasoning
+        tst.test(
+               "Calling both</think>\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ get_time_tool, get_weather_tool })
+            .expect(message_with_reasoning_content_and_multiple_tool_calls(
+                "Calling both", "",
+                { { "get_time", R"({"city": "Paris"})" }, { "get_weather", R"({"city": "Paris"})" } }))
+            .run();
+
+        // Tool call with content before tool calls
+        tst.test(
+               "Thinking about it</think>"
+               "Let me call the function.\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"special_function\">\n"
+               "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect_reasoning("Thinking about it")
+            .expect_content("Let me call the function.")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Tool call with two params of mixed types (string="false" and string="true")
+        tst.test(
+               "Multi-arg call</think>\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"magic_int\">\n"
+               "<｜DSML｜ parameter name=\"ref\" string=\"false\">42</｜DSML｜ parameter>\n"
+               "<｜DSML｜ parameter name=\"name\" string=\"true\">foo bar</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ magic_int_tool })
+            .expect_reasoning("Multi-arg call")
+            .expect_tool_calls({
+                { "magic_int", R"({"ref": 42, "name": "foo bar"})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // The V4 spelling (no leading space) is not a V4.1 tool call: it stays content.
+        tst.test(
+               "<｜DSML｜tool_calls>\n"
+               "<｜DSML｜invoke name=\"special_function\">\n"
+               "<｜DSML｜parameter name=\"arg1\" string=\"false\">1</｜DSML｜parameter>\n"
+               "</｜DSML｜invoke>\n"
+               "</｜DSML｜tool_calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect_content(
+               "<｜DSML｜tool_calls>\n"
+               "<｜DSML｜invoke name=\"special_function\">\n"
+               "<｜DSML｜parameter name=\"arg1\" string=\"false\">1</｜DSML｜parameter>\n"
+               "</｜DSML｜invoke>\n"
+               "</｜DSML｜tool_calls>")
+            .run();
+
+        // Continuation tests
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking</think>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(
+            "Let me check the time\n\n"
+            "<｜DSML｜ calls>\n"
+            "<｜DSML｜ invoke name=\"get_time\">\n"
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
+            "</｜DSML｜ invoke>\n"
+            "</｜DSML｜ calls>") // no </think> after the TC close because the grammar will immediately constrain it to end
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect_reasoning("Let me check the time")
+            .expect_tool_calls({ { "get_time", R"({"city": "Tokyo"})", {} } })
+            .run();
+    }
+
     // GLM-4.6 tests - format: <tool_call>function_name\n<arg_key>...</arg_key>\n<arg_value>...</arg_value>\n</tool_call>
     {
         auto tst = peg_tester("models/templates/GLM-4.6.jinja", detailed_debug);
@@ -6810,6 +6989,276 @@ static void test_template_generation_prompt() {
     }
 
     {
+        // DeepSeek-V4.1: leading-space DSML tags, numeric reasoning effort and the <｜System｜> token.
+        // Reference: DeepSeek's encoding.py for V4.1 (tests/test_output_1.txt is mirrored below).
+        auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja");
+        check(tmpls, basic(),                  "<｜Assistant｜><think>");
+        check(tmpls, continuation_content(),   "<｜Assistant｜><think>I'm thinking</think>Hello, ");
+        check(tmpls, continuation_reasoning(), "<｜Assistant｜><think>I'm");
+
+        auto continuation_content_no_thinking = continuation_content();
+        continuation_content_no_thinking.messages = { system_msg, message_user, simple_assist_msg("Hello, ") };
+        continuation_content_no_thinking.enable_thinking = false;
+        check(tmpls, continuation_content_no_thinking, "<｜Assistant｜></think>Hello, ");
+
+        const std::string system_token  = "<｜System｜>";
+        const std::string effort_prefix = system_token + "Reasoning Effort: ";
+        const std::string effort_suffix = " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+        auto effort_line = [&](const std::string & budget) { return effort_prefix + budget + effort_suffix; };
+
+        auto prompt_for = [&](const common_chat_templates_inputs & inputs) {
+            return common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        };
+        auto starts_with = [&](const std::string & prompt, const std::string & prefix) {
+            assert_equals(prefix, prompt.substr(0, prefix.size()));
+        };
+
+        // Thinking mode always renders the numeric effort prefix (default "high" = 75) ahead of the
+        // system prompt, and the whole thing is introduced by the <｜System｜> token.
+        common_chat_templates_inputs thinking_inputs;
+        thinking_inputs.messages        = { system_msg, message_user };
+        thinking_inputs.enable_thinking = true;
+        starts_with(prompt_for(thinking_inputs), effort_line("75") + system_msg.content + "<｜User｜>" + message_user.content);
+
+        auto low_inputs = thinking_inputs;
+        low_inputs.chat_template_kwargs["reasoning_effort"] = R"("low")";
+        starts_with(prompt_for(low_inputs), effort_line("50"));
+
+        auto high_inputs = thinking_inputs;
+        high_inputs.chat_template_kwargs["reasoning_effort"] = R"("high")";
+        starts_with(prompt_for(high_inputs), effort_line("75"));
+
+        auto max_inputs = thinking_inputs;
+        max_inputs.chat_template_kwargs["reasoning_effort"] = R"("max")";
+        starts_with(prompt_for(max_inputs), effort_line("100"));
+
+        auto numeric_inputs = thinking_inputs;
+        numeric_inputs.chat_template_kwargs["reasoning_effort"] = R"("42")";
+        starts_with(prompt_for(numeric_inputs), effort_line("42"));
+
+        // OpenAI-style aliases: minimal -> 50, medium -> 75, xhigh -> 100; anything else -> default 75.
+        auto minimal_inputs = thinking_inputs;
+        minimal_inputs.chat_template_kwargs["reasoning_effort"] = R"("minimal")";
+        starts_with(prompt_for(minimal_inputs), effort_line("50"));
+
+        auto medium_inputs = thinking_inputs;
+        medium_inputs.chat_template_kwargs["reasoning_effort"] = R"("medium")";
+        starts_with(prompt_for(medium_inputs), effort_line("75"));
+
+        auto xhigh_inputs = thinking_inputs;
+        xhigh_inputs.chat_template_kwargs["reasoning_effort"] = R"("xhigh")";
+        starts_with(prompt_for(xhigh_inputs), effort_line("100"));
+
+        auto unknown_inputs = thinking_inputs;
+        unknown_inputs.chat_template_kwargs["reasoning_effort"] = R"("bogus")";
+        starts_with(prompt_for(unknown_inputs), effort_line("75"));
+
+        auto out_of_range_inputs = thinking_inputs;
+        out_of_range_inputs.chat_template_kwargs["reasoning_effort"] = R"("250")";
+        starts_with(prompt_for(out_of_range_inputs), effort_line("75"));
+
+        // Thinking mode without a system message: the effort prefix stands on its own.
+        common_chat_templates_inputs thinking_no_system_inputs;
+        thinking_no_system_inputs.messages        = { message_user };
+        thinking_no_system_inputs.enable_thinking = true;
+        starts_with(prompt_for(thinking_no_system_inputs), effort_line("75") + "<｜User｜>" + message_user.content + "<｜Assistant｜><think>");
+
+        // Chat mode: no effort prefix; the system prompt still gets the <｜System｜> token.
+        auto chat_inputs = max_inputs;
+        chat_inputs.enable_thinking = false;
+        auto chat_prompt = prompt_for(chat_inputs);
+        assert_not_contains(chat_prompt, "Reasoning Effort:");
+        starts_with(chat_prompt, system_token + system_msg.content + "<｜User｜>" + message_user.content + "<｜Assistant｜></think>");
+
+        // Chat mode without a system message or tools: no <｜System｜> token at all.
+        common_chat_templates_inputs chat_no_system_inputs;
+        chat_no_system_inputs.messages        = { message_user };
+        chat_no_system_inputs.enable_thinking = false;
+        auto chat_no_system_prompt = prompt_for(chat_no_system_inputs);
+        assert_not_contains(chat_no_system_prompt, system_token);
+        starts_with(chat_no_system_prompt, "<｜User｜>" + message_user.content + "<｜Assistant｜></think>");
+
+        // Tools: the "## Tools" block uses the spaced tags, is introduced by <｜System｜> even without
+        // a system message, and precedes the response format.
+        common_chat_templates_inputs response_format_inputs;
+        response_format_inputs.messages        = { message_user };
+        response_format_inputs.enable_thinking = false;
+        response_format_inputs.tools           = { get_time_tool };
+        response_format_inputs.json_schema     = R"({"type":"object","properties":{"answer":{"type":"string"}}})";
+        auto response_format_prompt = prompt_for(response_format_inputs);
+        starts_with(response_format_prompt, system_token + "## Tools\n\n");
+        assert_contains(response_format_prompt,
+            "You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n"
+            "<｜DSML｜ calls>\n"
+            "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n"
+            "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n"
+            "...\n"
+            "</｜DSML｜ invoke>\n"
+            "<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n"
+            "...\n"
+            "</｜DSML｜ invoke>\n"
+            "</｜DSML｜ calls>\n\n");
+        assert_not_contains(response_format_prompt, "<｜DSML｜tool_calls>");
+        assert_not_contains(response_format_prompt, "<｜DSML｜invoke");
+        assert_not_contains(response_format_prompt, "<｜DSML｜parameter");
+        const auto tools_pos = response_format_prompt.find("## Tools");
+        const auto response_format_pos = response_format_prompt.find(
+            "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
+        if (tools_pos == std::string::npos || response_format_pos == std::string::npos || tools_pos > response_format_pos) {
+            LOG_ERR("Expected response format after tools\nActual: %s\n", response_format_prompt.c_str());
+            common_log_flush(common_log_main());
+            throw std::runtime_error("Test failed");
+        }
+        assert_contains(response_format_prompt, R"("answer": {"type": "string"})");
+
+        // Tool calls in the assistant history use the spaced tags; the tool result is rendered as a
+        // <tool_result> block inside the following user turn.
+        common_chat_templates_inputs history_inputs;
+        history_inputs.messages        = { message_user, tool_call_msg, tool_msg };
+        history_inputs.enable_thinking = false;
+        assert_ends_with(prompt_for(history_inputs),
+            "<｜Assistant｜></think>\n\n"
+            "<｜DSML｜ calls>\n"
+            "<｜DSML｜ invoke name=\"special_function\">\n"
+            "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
+            "</｜DSML｜ invoke>\n"
+            "</｜DSML｜ calls><｜end▁of▁sentence｜>"
+            "<｜User｜><tool_result>Sunny</tool_result><｜Assistant｜></think>");
+
+        common_chat_msg empty_tool_call = simple_assist_msg("", "", "empty_args", "{}");
+        common_chat_templates_inputs empty_tool_inputs;
+        empty_tool_inputs.messages = { message_user, empty_tool_call };
+        empty_tool_inputs.tools    = { empty_args_tool };
+        assert_contains(prompt_for(empty_tool_inputs), "<｜DSML｜ invoke name=\"empty_args\">\n\n</｜DSML｜ invoke>");
+
+        // The latest_reminder role renders as its special token (encoding.py tests/test_output_4.txt).
+        common_chat_msg reminder;
+        reminder.role    = "latest_reminder";
+        reminder.content = "2024-11-15,Shanghai,App";
+        common_chat_templates_inputs reminder_inputs;
+        reminder_inputs.messages        = { system_msg, reminder, message_user };
+        reminder_inputs.enable_thinking = false;
+        assert_equals(
+            system_token + system_msg.content + "<｜latest_reminder｜>2024-11-15,Shanghai,App" +
+                "<｜User｜>" + message_user.content + "<｜Assistant｜></think>",
+            prompt_for(reminder_inputs));
+
+        // A mid-conversation system message gets its own <｜System｜> token, counts as a user turn for
+        // reasoning retention and triggers the assistant header (encoding.py test_v41_mid_conversation_system_message).
+        common_chat_msg mid_system;
+        mid_system.role    = "system";
+        mid_system.content = "mid sys";
+        common_chat_templates_inputs mid_system_inputs;
+        mid_system_inputs.messages        = { system_msg, message_user, simple_assist_msg("a1", "r1"), mid_system };
+        mid_system_inputs.enable_thinking = true;
+        mid_system_inputs.chat_template_kwargs["reasoning_effort"] = R"("88")";
+        assert_equals(
+            effort_line("88") + system_msg.content + "<｜User｜>" + message_user.content +
+                "<｜Assistant｜></think>a1<｜end▁of▁sentence｜>" + system_token + "mid sys<｜Assistant｜><think>",
+            prompt_for(mid_system_inputs));
+
+        // Full transcript check against encoding.py's tests/test_output_1.txt (minus the BOS token,
+        // which is empty without a model): thinking mode, tools, a tool call with two string params,
+        // a tool result and a final answer. Tools keep every reasoning trace.
+        static common_chat_tool ref_weather_tool{
+            "get_weather", "Get the weather for a specific location",
+            R"({"type": "object", "properties": {"location": {"type": "string", "description": "The city name"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"], "description": "Temperature unit"}}, "required": ["location"]})",
+        };
+        static common_chat_tool ref_search_tool{
+            "search", "Search the web for information",
+            R"({"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "num_results": {"type": "integer", "description": "Number of results to return"}}, "required": ["query"]})",
+        };
+        common_chat_msg ref_user;
+        ref_user.role    = "user";
+        ref_user.content = "What's the weather like in Beijing?";
+        common_chat_msg ref_call = simple_assist_msg(
+            "", "The user wants the weather in Beijing. I should call get_weather.",
+            "get_weather", R"({"location": "Beijing", "unit": "celsius"})", "call_0");
+        common_chat_msg ref_result;
+        ref_result.role         = "tool";
+        ref_result.tool_name    = "get_weather";
+        ref_result.tool_call_id = "call_0";
+        ref_result.content      = R"({"temperature": 22, "condition": "sunny", "humidity": 45})";
+        common_chat_msg ref_answer = simple_assist_msg(
+            "The weather in Beijing is currently sunny with a temperature of 22°C and 45% humidity.",
+            "Got the weather data. Let me format a nice response.");
+
+        common_chat_templates_inputs ref_inputs;
+        ref_inputs.messages              = { system_msg, ref_user, ref_call, ref_result, ref_answer };
+        ref_inputs.tools                 = { ref_weather_tool, ref_search_tool };
+        ref_inputs.enable_thinking       = true;
+        ref_inputs.add_generation_prompt = false;
+        const std::string ref_expected =
+            "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+            "You are a helpful assistant.\n\n"
+            "## Tools\n\n"
+            "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n"
+            "<｜DSML｜ calls>\n"
+            "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n"
+            "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n"
+            "...\n"
+            "</｜DSML｜ invoke>\n"
+            "<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n"
+            "...\n"
+            "</｜DSML｜ invoke>\n"
+            "</｜DSML｜ calls>\n\n"
+            "String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+            "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+            "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+            "### Available Tool Schemas\n\n"
+            R"({"name": "get_weather", "description": "Get the weather for a specific location", "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "The city name"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"], "description": "Temperature unit"}}, "required": ["location"]}})" "\n"
+            R"({"name": "search", "description": "Search the web for information", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "num_results": {"type": "integer", "description": "Number of results to return"}}, "required": ["query"]}})" "\n\n"
+            "You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n"
+            "<｜User｜>What's the weather like in Beijing?"
+            "<｜Assistant｜><think>The user wants the weather in Beijing. I should call get_weather.</think>\n\n"
+            "<｜DSML｜ calls>\n"
+            "<｜DSML｜ invoke name=\"get_weather\">\n"
+            "<｜DSML｜ parameter name=\"location\" string=\"true\">Beijing</｜DSML｜ parameter>\n"
+            "<｜DSML｜ parameter name=\"unit\" string=\"true\">celsius</｜DSML｜ parameter>\n"
+            "</｜DSML｜ invoke>\n"
+            "</｜DSML｜ calls><｜end▁of▁sentence｜>"
+            "<｜User｜><tool_result>{\"temperature\": 22, \"condition\": \"sunny\", \"humidity\": 45}</tool_result>"
+            "<｜Assistant｜><think>Got the weather data. Let me format a nice response.</think>"
+            "The weather in Beijing is currently sunny with a temperature of 22°C and 45% humidity.<｜end▁of▁sentence｜>";
+        assert_equals(ref_expected, prompt_for(ref_inputs));
+
+        const auto caps = common_chat_templates_get_caps(tmpls.get());
+        assert_equals(true,  caps.at("supports_preserve_reasoning"));
+        assert_equals(true,  caps.at("supports_reasoning_effort"));
+        assert_equals(true,  caps.at("supports_string_content"));
+
+        // Detection: the parser must pick the V4.1 literals (grammar trigger "<｜DSML｜ calls>") both
+        // for the shipped template (tags built from ' calls' / ' invoke' / ' parameter' strings) and
+        // for a variant that spells the rendered tags literally; the V4 template keeps "tool_calls".
+        auto trigger_for = [&](const std::string & src) {
+            auto variant = common_chat_templates_ptr(common_chat_templates_init(nullptr, src));
+            common_chat_templates_inputs inputs;
+            inputs.messages = { message_user };
+            inputs.tools    = { special_function_tool };
+            auto params = common_chat_templates_apply(variant.get(), inputs);
+            assert_equals((size_t) 1, params.grammar_triggers.size());
+            return params.grammar_triggers[0].value;
+        };
+        const std::string v41_src = read_file("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja");
+        assert_equals(std::string("<｜DSML｜ calls>"), trigger_for(v41_src));
+
+        auto literal_src = v41_src;
+        string_replace_all(literal_src, "dsml_token + tc_block_name",           "'｜DSML｜ calls'");
+        string_replace_all(literal_src, "dsml_token + tool_call_tag_name",      "'｜DSML｜ invoke'");
+        string_replace_all(literal_src, "dsml_token + tool_parameter_tag_name", "'｜DSML｜ parameter'");
+        string_replace_all(literal_src, "' calls'",     "'unused'");
+        string_replace_all(literal_src, "' invoke'",    "'unused'");
+        string_replace_all(literal_src, "' parameter'", "'unused'");
+        assert_not_contains(literal_src, "' calls");
+        assert_not_contains(literal_src, "\" calls");
+        assert_contains(literal_src, "｜DSML｜ calls");
+        assert_equals(std::string("<｜DSML｜ calls>"), trigger_for(literal_src));
+
+        assert_equals(std::string("<｜DSML｜tool_calls>"),
+                      trigger_for(read_file("models/templates/deepseek-ai-DeepSeek-V4.jinja")));
+    }
+
+    {
         auto tmpls = read_templates("models/templates/openbmb-MiniCPM5-1B.jinja");
         check(tmpls, basic(),                  "<|im_start|>assistant\n<think>\n");
         check(tmpls, continuation_content(),   "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, ");
@@ -7067,6 +7516,7 @@ static void test_reasoning_effort_caps() {
     };
 
     assert_supports_effort("models/templates/deepseek-ai-DeepSeek-V4.jinja", true);
+    assert_supports_effort("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja", true);
     assert_supports_effort("models/templates/muse-glimmer.jinja", true);
     assert_supports_effort("models/templates/tencent-Hy3.jinja", true);
     assert_supports_effort("models/templates/openai-gpt-oss-120b.jinja", true);
