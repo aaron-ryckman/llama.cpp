@@ -56,6 +56,10 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     dsv41_copy(kv_src,    hparams.dsv41_kv_source_layers,    "kv_source_layer_ids");
     dsv41_copy(index_src, hparams.dsv41_index_source_layers, "index_source_layer_ids");
 
+    // Say at model load whether the sparse selection is on, at WARN, every load. The auto-fitter loads the model once
+    // under a log callback that demotes everything to DEBUG before the real load; a log-once would be spent there.
+    llama_dsv41_topk_log_state("load_arch_hparams");
+
     ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS,      layer_ids,        false);
     ml.get_arr(LLM_KV_ENGRAM_NUM_EMBEDDINGS, num_embeddings,   false);
     ml.get_arr(LLM_KV_ENGRAM_PRIMES,         primes,           false);
