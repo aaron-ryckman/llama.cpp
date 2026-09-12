@@ -188,6 +188,7 @@ The sidecars carry no version key, so the loader decides all three from the abse
 The V4.1 tap is the attention input of the configured target layers (37, 38, 39), which is what the tap already recorded for V4; a V4 sidecar's `target_layers` carry a +1 that turns V4's "output of layer i" into "input of layer i+1", and a V4.1 sidecar's do not.
 The tap is taken after a layer's Engram contribution, as the reference orders them; no V4.1 tap layer carries one, so this changes nothing measurable.
 Block size 5, anchor-first, noise token 128799 and the confidence-gated truncation are read from the sidecar as before.
+The sidecar can be pinned to one GPU with `-devd`: it borrows the target's `output.weight`, which under `-sm layer` sits on the target's last device, so the draft context now adds that device's backend when it is not among the draft's own (without it the scheduler's split pass aborted on the foreign leaf, `GGML_ASSERT(src_backend_id != -1)`); the lm head runs where its weight lives and only the activations and logits cross devices.
 `LLAMA_DSV41_DECODER_SKIP` declines a prompt ubatch that requests a tap past the decoder's source layer (layer 20), so it never engages while a V4.1 DSpark draft is attached; `LLAMA_DSV41_TOPK` is unaffected.
 
 Unverified: this was written against the reference `inference/model.py` and the sidecar's GGUF metadata and built CPU-only; it has not yet run against the real model, so no acceptance or throughput figure is claimed here.

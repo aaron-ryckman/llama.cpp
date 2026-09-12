@@ -359,6 +359,49 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // A sidecar that borrows the target's token embeddings and/or output projection through ctx_other
+        // (DFlash/DSpark/EAGLE3 exports without their own) reads those tensors where the target placed them.
+        // Under -sm layer that is the target's last device for output.weight, which need not be one of this
+        // model's devices once -devd pins the sidecar to a GPU of its own. A weight whose buffer no scheduler
+        // backend supports is a leaf without a backend, and the split pass aborts on it
+        // (ggml_backend_sched_split_graph: GGML_ASSERT(src_backend_id != -1)) - seen creating the V4.1 DSpark
+        // draft context with -devd ROCm3 while output.weight sat on ROCm7. Add the borrowed tensors' devices
+        // here: the lm head then runs where its weight lives and only the n_embd-wide activations and the
+        // logits cross devices. Host buffers need nothing, the CPU backend below covers them.
+        if (cparams.ctx_other != nullptr) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            const ggml_tensor * borrowed[] = {
+                model.tok_embd == nullptr ? model_other->tok_embd : nullptr,
+                model.output   == nullptr ? model_other->output   : nullptr,
+            };
+            for (const ggml_tensor * t : borrowed) {
+                if (t == nullptr || t->buffer == nullptr) {
+                    continue;
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev == nullptr || ggml_backend_buft_is_host(buft) ||
+                        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                bool present = false;
+                for (const auto & backend : backends) {
+                    present = present || ggml_backend_get_device(backend.get()) == dev;
+                }
+                if (present) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend for the borrowed tensor %s",
+                            ggml_backend_dev_name(dev), t->name));
+                }
+                LLAMA_LOG_INFO("%s: adding %s backend: the target's %s is borrowed through ctx_other and lives there\n",
+                        __func__, ggml_backend_dev_name(dev), t->name);
+                backends.emplace_back(backend);
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
