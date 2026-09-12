@@ -368,7 +368,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor ** comb,
         int il,
         ggml_tensor ** pre_out,
-        ggml_tensor  * mix_in) const {
+        ggml_tensor  * mix_in,
+        bool           collapse) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
     const int64_t hc_mix_dim = (2 + hc)*hc;
@@ -418,6 +419,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         *comb = build_hc_sinkhorn(*comb, il);
     }
     cb(*comb, "hc_comb", il);
+
+    if (!collapse) {
+        // the caller collapses on its own (V4.1 layer 0: one-hot on copy 0); do not build a collapse that would
+        // never join the graph, see the declaration
+        return nullptr;
+    }
 
     // V4 collapses with the mix this sublayer just computed.
     // V4.1 hands its coefficients to the NEXT sublayer instead - attention uses the previous block's ffn mix, the FFN uses this block's attention mix - so the caller passes the carried one.
@@ -2079,17 +2086,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
 
+        // V4.1 layer 0 has no carried mix yet: the initial one-hot selects copy 0, so no collapse is built for it.
+        // (Building one and discarding it left a fused node outside the graph, which disabled the fused HC ops for all layers.)
+        const bool hc_onehot = hc_shift && carry_pre == nullptr;
         ggml_tensor * attn_pre = nullptr;
         cur = build_hc_pre(inpL,
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &post, &comb, il, &attn_pre, hc_shift ? carry_pre : nullptr);
-        if (hc_shift && carry_pre == nullptr) {
+                &post, &comb, il, &attn_pre, hc_shift ? carry_pre : nullptr, /*collapse=*/ !hc_onehot);
+        if (hc_onehot) {
             // the initial one-hot mix selects copy 0
             cur = ggml_cont_2d(ctx0, ggml_view_2d(ctx0, inpL, n_embd, inpL->ne[2], inpL->nb[2], 0),
                     n_embd, inpL->ne[2]);
         }
+        GGML_ASSERT(cur != nullptr);
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);

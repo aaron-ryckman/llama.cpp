@@ -580,12 +580,20 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
             if (device_fused != device_layer) {
-                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
-                        "is assigned to device %s (usually due to missing support)\n",
-                        func, node.il,
-                        device_layer ? ggml_backend_dev_name(device_layer) : "none",
-                        probe.name,
-                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                if (device_fused == nullptr) {
+                    // the scheduler assigns a backend to every node it can reach; none means the fused node was
+                    // built and registered but never joined the graph - a graph-construction bug, not missing support
+                    LLAMA_LOG_WARN("%s: layer %d: %s node '%s' is not reachable from the graph outputs "
+                            "(dangling fused node built by the graph, not a backend support issue)\n",
+                            func, node.il, probe.name, ggml_get_name(node.tensor));
+                } else {
+                    LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+                            "is assigned to device %s (usually due to missing support)\n",
+                            func, node.il,
+                            device_layer ? ggml_backend_dev_name(device_layer) : "none",
+                            probe.name,
+                            ggml_backend_dev_name(device_fused));
+                }
                 device_mismatch = true;
                 break;
             }
