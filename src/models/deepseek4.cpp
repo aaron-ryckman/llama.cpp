@@ -1313,7 +1313,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 //
 // Off by default; when off the graph is what it was. A decode ubatch (n_tokens <= n_swa) is never touched.
 // Requests that want rows for tokens the decoder no longer sees - embeddings, all-token logits, layer-input
-// taps past the source layer, unmasked next-n hidden states - take the full graph for that ubatch.
+// taps past the source layer, unmasked next-n hidden states - take the full graph for that ubatch, as do
+// ubatches holding more than one sequence (their tokens are not one run of positions). Every condition comes
+// from the ubatch and the hparams, never from the cache: a one-sequence ubatch gets one raw mask block filled
+// from its own stream's cells whatever the cache's stream count, and its write idxs are global rows
+// (stream*size + cell), so a tail view of them is valid on a multi-stream cache too.
+// The first decline of a prompt-sized ubatch is logged once with its reason, so a field run can be diagnosed.
 
 static bool dsv41_decoder_skip_env() {
     static const bool on = [] {
@@ -1327,6 +1332,8 @@ struct dsv41_decoder_skip {
     bool    engaged = false;
     int     il_dec  = -1; // the decoder's KV source layer, where the narrowing happens
     int64_t n_tail  = 0;  // tokens the decoder half runs over
+
+    const char * declined = nullptr; // when not engaged: the condition that failed
 };
 
 // The decoder's single KV source: a ratio 1 source layer with every layer after it at ratio 1 and reading its rows.
@@ -1359,11 +1366,20 @@ static int dsv41_decoder_source_layer(const llama_hparams & hparams) {
 }
 
 // Whether this ubatch takes the narrowed graph. Evaluated from the graph params so the reuse check can ask the same question.
+// Every condition is read off the ubatch and the hparams; the cache's stream layout does not enter into it.
 static dsv41_decoder_skip dsv41_plan_decoder_skip(const llm_graph_params & params) {
     dsv41_decoder_skip res;
 
-    if (!dsv41_decoder_skip_env() || params.arch != LLM_ARCH_DEEPSEEK41) {
+    auto decline = [&](const char * why) {
+        res.declined = why;
         return res;
+    };
+
+    if (!dsv41_decoder_skip_env()) {
+        return decline("LLAMA_DSV41_DECODER_SKIP not set");
+    }
+    if (params.arch != LLM_ARCH_DEEPSEEK41) {
+        return decline("arch is not deepseek41");
     }
 
     const auto & hparams = params.hparams;
@@ -1373,55 +1389,66 @@ static dsv41_decoder_skip dsv41_plan_decoder_skip(const llm_graph_params & param
     const int64_t n_swa    = hparams.n_swa;
     const int64_t n_tokens = ubatch.n_tokens;
 
+    if (n_swa <= 0) {
+        return decline("n_swa == 0");
+    }
     // a decode ubatch keeps the full graph
-    if (n_swa <= 0 || n_tokens <= n_swa) {
-        return res;
+    if (n_tokens <= n_swa) {
+        return decline("n_tokens <= n_swa (decode ubatch)");
     }
 
     const int il_dec = dsv41_decoder_source_layer(hparams);
     if (il_dec < 0) {
-        return res;
+        return decline("hparams are not one ratio-1 KV source with every later layer reading it");
     }
 
     // everything that wants rows for tokens the decoder would no longer see
-    if (!cparams.causal_attn || cparams.embeddings) {
-        return res;
+    if (!cparams.causal_attn) {
+        return decline("causal_attn is off");
+    }
+    if (cparams.embeddings) {
+        return decline("embeddings are on");
     }
     if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
-        return res;
+        return decline("unmasked next-n hidden states are requested");
     }
     for (size_t il = (size_t) il_dec + 1; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
-            return res;
+            return decline("a layer-input tap past the source layer is requested");
         }
     }
 
-    // one sequence in position order, with the raw cache writing exactly this ubatch, so the tail is the last n_swa positions
-    if (ubatch.n_seqs_unq != 1 || ubatch.n_pos != 1 || ubatch.pos == nullptr || ubatch.n_seq_id == nullptr) {
-        return res;
+    // one sequence, one run of positions: the tail is then the last n_swa positions of that sequence
+    if (ubatch.n_pos != 1) {
+        return decline("n_pos != 1");
+    }
+    if (ubatch.pos == nullptr || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        return decline("ubatch carries no pos/seq_id");
+    }
+    if (ubatch.n_seqs_unq != 1) {
+        return decline("n_seqs_unq != 1 (more than one sequence in the ubatch)");
     }
     for (int64_t i = 0; i < n_tokens; ++i) {
-        if (ubatch.n_seq_id[i] != 1 || ubatch.pos[i] != ubatch.pos[0] + i) {
-            return res;
+        if (ubatch.n_seq_id[i] != 1) {
+            return decline("n_seq_id != 1 (a token shared by sequences)");
+        }
+        if (ubatch.seq_id[i][0] != ubatch.seq_id[0][0]) {
+            return decline("tokens of more than one seq_id");
+        }
+        if (ubatch.pos[i] != ubatch.pos[0] + i) {
+            return decline("positions are not one contiguous run");
         }
     }
 
-    const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
-    if (mctx == nullptr || mctx->get_raw() == nullptr) {
-        return res;
-    }
-    if (mctx->get_raw()->get_n_write() != (uint32_t) n_tokens) {
-        return res;
-    }
-    if (mctx->get_csa_plan(ubatch).n_stream != 1) {
-        return res;
+    if (params.mctx == nullptr) {
+        return decline("no memory context");
     }
 
     // the outputs asked for have to be tail tokens; a prompt chunk asks for none, or for the last one
     const int64_t head = n_tokens - n_swa;
     if (params.n_outputs > 0) {
         if (ubatch.output == nullptr) {
-            return res;
+            return decline("n_outputs > 0 without an output map");
         }
         int64_t n_tail_out = 0;
         for (int64_t i = 0; i < n_tokens; ++i) {
@@ -1429,12 +1456,12 @@ static dsv41_decoder_skip dsv41_plan_decoder_skip(const llm_graph_params & param
                 continue;
             }
             if (i < head) {
-                return res;
+                return decline("an output token is outside the tail");
             }
             ++n_tail_out;
         }
         if (n_tail_out != (int64_t) params.n_outputs) {
-            return res;
+            return decline("n_outputs does not match the output map");
         }
     }
 
@@ -1584,6 +1611,7 @@ bool llm_graph_input_dsv41_tail::can_reuse(const llm_graph_params & params) {
 
     res &= (out_ids ? out_ids->ne[0] : 0) == (int64_t) params.n_outputs;
 
+    // the mask copy is sized to the raw mask, whose own reuse check covers the rest of its shape
     const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
     res &= kq_mask != nullptr && mctx != nullptr && mctx->get_raw() != nullptr;
     if (res) {
@@ -1640,12 +1668,23 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         // registered even when not engaged, so the reuse check re-asks the question for the next ubatch
         tail_inp = std::make_unique<llm_graph_input_dsv41_tail>(skip, (uint32_t) n_outputs);
     }
-    if (skip.engaged) {
-        static bool logged = false;
-        if (!logged) {
-            LLAMA_LOG_INFO("deepseek41: LLAMA_DSV41_DECODER_SKIP=1, prompt ubatches run layers %d-%d over their last %d tokens only\n",
-                    skip.il_dec, (int) n_layer - 1, (int) skip.n_tail);
-            logged = true;
+    // WARN so the lines show at the server's default verbosity; each once per process
+    if (tail_inp) {
+        if (skip.engaged) {
+            static bool logged_engaged = false;
+            if (!logged_engaged) {
+                LLAMA_LOG_WARN("deepseek41: decoder-skip engaged: layers %d-%d run over the last %d of %d tokens (n_outputs=%d)\n",
+                        skip.il_dec, (int) n_layer - 1, (int) skip.n_tail, (int) n_tokens, (int) n_outputs);
+                logged_engaged = true;
+            }
+        } else if ((int64_t) n_tokens > (int64_t) hparams.n_swa) {
+            // a decode ubatch declines by design and is not worth a line
+            static bool logged_declined = false;
+            if (!logged_declined) {
+                LLAMA_LOG_WARN("deepseek41: decoder-skip declined for a %d-token ubatch (n_outputs=%d): %s\n",
+                        (int) n_tokens, (int) n_outputs, skip.declined ? skip.declined : "unknown");
+                logged_declined = true;
+            }
         }
     }
 
@@ -1672,7 +1711,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     if (tail_inp) {
         tail_inp->inp_raw = inp_attn;
         if (skip.engaged) {
-            GGML_ASSERT(inp_attn->self_kq_mask->ne[3] == 1);
+            // a one-sequence, non-coupled ubatch is written as itself and gets one mask block; the tail views rely on both
+            GGML_ASSERT(inp_attn->self_k_idxs->ne[0] == n_tokens && "deepseek41 decoder skip: raw write idxs are not one per ubatch token");
+            GGML_ASSERT(inp_attn->self_kq_mask->ne[3] == 1 && inp_attn->self_kq_mask->ne[1] == n_tokens && "deepseek41 decoder skip: raw mask is not one block of n_tokens rows");
             tail_inp->kq_mask = ggml_new_tensor_4d(ctx0, inp_attn->self_kq_mask->type, inp_attn->self_kq_mask->ne[0], skip.n_tail, 1, 1);
             ggml_set_input(tail_inp->kq_mask);
             ggml_set_name(tail_inp->kq_mask, "dsv41_tail_kq_mask");
