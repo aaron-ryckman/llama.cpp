@@ -1190,6 +1190,10 @@ struct llama_model_deepseek4 : public llama_model_base {
 
         // mix_in is the mix to collapse x with.
         // V4 leaves it null and uses the one computed here; V4.1 shifts the coefficients by one sublayer and passes the carried mix.
+        // collapse=false computes pre/post/comb but emits no collapse and returns nullptr: V4.1's first sublayer collapses
+        // with a one-hot mix the caller applies as a plain copy select. A fused collapse built here and then dropped would
+        // still be registered as a fused node; never scheduled, it has no backend, and resolve_fused_ops() reads that as
+        // "unsupported" and disables the fused op for every layer.
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
@@ -1199,7 +1203,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor ** comb,
                 int il,
                 ggml_tensor ** pre_out = nullptr,
-                ggml_tensor  * mix_in  = nullptr) const;
+                ggml_tensor  * mix_in  = nullptr,
+                bool           collapse = true) const;
 
         // V4 folds the hyper-connection copies with its own output_hc_* head tensors.
         // V4.1 ships none and reuses the mix the last layer already computed.
