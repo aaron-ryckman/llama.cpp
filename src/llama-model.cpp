@@ -3273,8 +3273,11 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
-    // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+    // other compression ratios, so we return 0 here. V4.1 shares the cache:
+    // reporting its 128-token window made the server assume a rollback point
+    // that get_can_checkpoint() refuses, so every multi-turn request reset
+    // n_past to 0 and re-prefilled the whole prompt.
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
         return 0;
     }
     return model->hparams.n_swa;
