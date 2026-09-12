@@ -9,6 +9,7 @@
 #include <map>
 
 class llama_memory_hybrid_idx_context;
+class llama_kv_cache_dsv4_comp_context;
 
 //
 // base classes
@@ -1245,6 +1246,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int il,
                 ggml_tensor * cur_comp = nullptr) const;
 
+        // pre_rope, when given, receives the pooled and normed latent before RoPE: DeepSeek-V4.1 derives its index keys from that form.
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,
                 ggml_tensor * score_state,
@@ -1254,7 +1256,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int64_t ratio,
                 int64_t n_embd_head,
                 const char * name,
-                int il) const;
+                int il,
+                ggml_tensor ** pre_rope = nullptr) const;
 
         ggml_tensor * build_overlap_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1295,6 +1298,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int il) const;
 
         // il_kv names the layer whose compressed rows are read, which V4.1 needs because its layers reuse the cache of the source layer before them. idx_tier picks between the two compressed tiers.
+        // top_k, when given, is I32 [n_top_k, n_tokens/n_stream, 1, n_stream] of compressed rows to keep; every other compressed row is masked out (V4.1 sparse selection).
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,
                 llm_graph_input_dsv4_raw * inp_attn,
@@ -1304,7 +1308,50 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 int il,
                 int il_kv,
-                bool idx_tier) const;
+                bool idx_tier,
+                ggml_tensor * top_k = nullptr) const;
+
+        // DeepSeek-V4.1 sparse selection (LLAMA_DSV41_TOPK=1). Implemented in deepseek4.cpp next to the V4 indexer they mirror.
+        // Index keys of the rows a KV source just pooled, written into the tier's index-key cache at the same row ids as the compressed KV.
+        ggml_tensor * build_dsv41_index_keys(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                const llm_graph_input_dsv4::comp_input & tier,
+                const llama_kv_cache_dsv4_comp_context * lid_ctx,
+                ggml_tensor * latent_pre,
+                int il) const;
+
+        // This layer's indexer queries against the keys layer il_keys published; returns the top-k row ids per query.
+        // Publishes the candidate-block mask at the candidate source and applies it at the index sources after it.
+        ggml_tensor * build_dsv41_indexer_top_k(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                const llm_graph_input_dsv4::comp_input & tier,
+                const llama_kv_cache_dsv4_comp_context * lid_ctx,
+                int il_keys,
+                ggml_tensor * qr,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        // 0 on the selected rows, -inf elsewhere: [n_rows, n_tokens/n_stream, 1, n_stream] from I32 idxs [n_sel, n_tokens/n_stream, 1, n_stream].
+        ggml_tensor * build_dsv41_select_mask(
+                ggml_tensor * idxs,
+                int64_t n_rows,
+                ggml_type type,
+                const char * name,
+                int il) const;
+
+        // Level one of V4.1's two-level selection: the candidate_topk_blocks best blocks of candidate_block_size rows, as a 0/-inf additive mask over rows.
+        ggml_tensor * build_dsv41_candidate_mask(
+                ggml_tensor * score,
+                ggml_tensor * kq_mask,
+                int il) const;
+
+        // LLAMA_DSV41_TOPK: the rows the most recent index source picked, reused by the layers after it up to the next index source, plus the tier they index; and the candidate-block mask the candidate source published for the index sources after it.
+        mutable ggml_tensor * dsv41_top_k       = nullptr;
+        mutable int64_t       dsv41_top_k_ratio = 0;
+        mutable ggml_tensor * dsv41_cand_mask   = nullptr;
 
         ggml_tensor * build_raw_attention(
                 llm_graph_input_dsv4_raw * inp_attn,
