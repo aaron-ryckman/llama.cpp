@@ -179,7 +179,18 @@ Three diagnostic env gates ship with the support, all default off and each loggi
 
 Scope: `-sm layer` only.
 `-sm tensor` loads and runs but does not reproduce its own output, so it carries no claim here.
-Speculative decoding against a V4.1 DSpark sidecar is not supported yet.
+
+### DSpark speculative decoding for V4.1
+
+`--spec-type draft-dspark --spec-draft-model <DeepSeek-V4.1-Flash-DSpark.gguf>` accepts a V4.1 target.
+The sidecar is the same `dflash` arch on the DSV4 backbone as the V4 one, and the three things that separate the V4.1 target from V4 separate the two sidecars too: the V4.1 stages hand each sublayer's hyper-connection mix to the next one from a one-hot start, the collapse before the head reuses the mix the last stage's FFN computed instead of `output_hc_*` tensors, and the per-head query norm is gone.
+The sidecars carry no version key, so the loader decides all three from the absence of `output_hc_*`, as the target decides its own fold; the choice is logged at load.
+The V4.1 tap is the attention input of the configured target layers (37, 38, 39), which is what the tap already recorded for V4; a V4 sidecar's `target_layers` carry a +1 that turns V4's "output of layer i" into "input of layer i+1", and a V4.1 sidecar's do not.
+The tap is taken after a layer's Engram contribution, as the reference orders them; no V4.1 tap layer carries one, so this changes nothing measurable.
+Block size 5, anchor-first, noise token 128799 and the confidence-gated truncation are read from the sidecar as before.
+`LLAMA_DSV41_DECODER_SKIP` declines a prompt ubatch that requests a tap past the decoder's source layer (layer 20), so it never engages while a V4.1 DSpark draft is attached; `LLAMA_DSV41_TOPK` is unaffected.
+
+Unverified: this was written against the reference `inference/model.py` and the sidecar's GGUF metadata and built CPU-only; it has not yet run against the real model, so no acceptance or throughput figure is claimed here.
 
 ## Qwen3.8-Flash-Next tensor parallelism
 

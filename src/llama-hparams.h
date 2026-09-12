@@ -297,6 +297,12 @@ struct llama_hparams {
     uint32_t dsv41_candidate_src_layer = 0;
     uint32_t dsv41_candidate_block     = 0;
     uint32_t dsv41_candidate_topk      = 0;
+    // A DSpark sidecar (arch dflash on the DSV4 backbone) for a DeepSeek-V4.1 target. Its stages take V4.1's semantics:
+    // the hyper-connection mix a sublayer computes is consumed by the next one from a one-hot start, the collapse before
+    // the head reuses the mix the last FFN computed (no output_hc_* tensors), and wq_b's output is not renormalized per head.
+    // V4 and V4.1 sidecars share the arch and carry no version key, so this is decided at load from the absence of the
+    // output_hc_* fold, as the target decides its own fold.
+    bool     dsv41_dspark              = false;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv41_kv_source_layers    = {};
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv41_index_source_layers = {};
 

@@ -1379,12 +1379,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
     // V4 renormalizes q per head after wq_b.
     // V4.1 does not: its only query norm is the one on wq_a's output, and this second one rescales every head's attention scores.
+    // The V4.1 DSpark sidecar's stages (arch dflash, hparams.dsv41_dspark) are V4.1 attention too (reference DSparkAttention.forward: wq_b(qr) straight into RoPE).
     // LLAMA_DSV41_QNORM=1 puts it back for A/B.
     static const bool q_norm_off = [] {
         const char * e = getenv("LLAMA_DSV41_QNORM");
         return !(e != nullptr && atoi(e) != 0);
     }();
-    if (!(hparams.dsv41_n_kv_source > 0 && q_norm_off)) {
+    const bool v41_attn = hparams.dsv41_n_kv_source > 0 || hparams.dsv41_dspark;
+    if (!(v41_attn && q_norm_off)) {
         q = ggml_rms_norm(ctx0, q, norm_rms_eps);
     }
     cb(q, "q_norm", il);
@@ -2235,6 +2237,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     std::unique_ptr<llm_graph_input_dsv4> inp_dsv4_tail;
 
     for (int il = 0; il < n_layer; ++il) {
+        // the engram writes into the residual before the block body, so the whole layer sees it.
+        if (!engram_off && model.layers[il].engram_embed) {
+            inpL = build_engram(model, inpL, inp_engram_cur, il);
+            cb(inpL, "engram_out", il);
+        }
+
+        // DSpark tap: the mean over the hc copies of this layer's attention input. The V4.1 reference takes it after the
+        // layer's engram (Transformer.forward: engram, then main_hiddens.append(h.mean(dim=2)), then the block), so the
+        // tap sits after it here too; V4 has no engram, and its sidecar's target_layers already carry the +1 that turns
+        // V4's "output of layer i" into "input of layer i+1".
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -2242,12 +2254,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             // the dependency chain in a different DFS order than the natural build
             // and interleaves every device boundary, adding 2 sched splits per
             // boundary under -sm layer (measured 65 vs 51 splits)
-        }
-
-        // the engram writes into the residual before the block body, so the whole layer sees it.
-        if (!engram_off && model.layers[il].engram_embed) {
-            inpL = build_engram(model, inpL, inp_engram_cur, il);
-            cb(inpL, "engram_out", il);
         }
 
         ggml_tensor * residual = inpL;
