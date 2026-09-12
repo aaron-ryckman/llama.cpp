@@ -11,8 +11,14 @@
 // LLAMA_DSV41_TOPK=1 turns on DeepSeek-V4.1's sparse top-k selection over the compressed stream
 // (index keys, indexer scores, shared top-k, candidate blocks). Default off: the dense path stays
 // byte-identical. Read once; the KV cache and the graph builder both key off it, because the
-// plain-tier index-key cache only exists when the selection runs.
+// plain-tier index-key cache only exists when the selection runs. Silent: it must not log, because
+// its first call can land inside the auto-fitter's trial init (common_fit_params), whose temporary
+// log callback demotes everything to DEBUG, and a log-once there is lost for good.
 bool llama_dsv41_topk_enabled();
+
+// Logs the state (raw value and effect) at WARN so the field sees it at default verbosity. Logs on
+// every call, never once: the model is loaded both by the fitter's trial and for real.
+void llama_dsv41_topk_log_state(const char * where);
 
 class llama_dsv4_comp_state {
 public:

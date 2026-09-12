@@ -32,13 +32,20 @@ static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
 bool llama_dsv41_topk_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_DSV41_TOPK");
-        const bool v = e != nullptr && atoi(e) != 0;
-        if (v) {
-            LLAMA_LOG_WARN("deepseek41: LLAMA_DSV41_TOPK=1, sparse top-k selection over the compressed stream enabled (prototype)\n");
-        }
-        return v;
+        return e != nullptr && atoi(e) != 0;
     }();
     return on;
+}
+
+void llama_dsv41_topk_log_state(const char * where) {
+    const char * e = getenv("LLAMA_DSV41_TOPK");
+    if (llama_dsv41_topk_enabled()) {
+        LLAMA_LOG_WARN("deepseek41: %s: LLAMA_DSV41_TOPK=%s, sparse top-k selection over the compressed stream enabled (prototype)\n", where, e ? e : "?");
+    } else if (e != nullptr) {
+        LLAMA_LOG_WARN("deepseek41: %s: LLAMA_DSV41_TOPK='%s' is not a nonzero integer, sparse top-k selection stays off\n", where, e);
+    } else {
+        LLAMA_LOG_WARN("deepseek41: %s: LLAMA_DSV41_TOPK unset, dense attention over the compressed stream\n", where);
+    }
 }
 
 static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
@@ -1378,8 +1385,13 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // tiers (ratio 2: layers 2/8/14, ratio 1: layer 20). kv_lid above mirrors kv_csa row for row and
     // covers the ratio-2 sources; the ratio-1 source needs a cache that mirrors kv_hca the same way,
     // because the plan's row ids (stream offset + pos/ratio) are only valid in a cache of the same size.
+    // WARN, not INFO: the server shows only WARN at default verbosity, and this line is how the field tells the sparse
+    // path is actually built. Logged at every construction on purpose, the fitter's trial one included.
+    if (llama_dsv41_topk_enabled() && !v41_tiers) {
+        LLAMA_LOG_WARN("%s: LLAMA_DSV41_TOPK set but the model declares no kv_source_layer_ids, sparse top-k selection has nothing to do\n", __func__);
+    }
     if (v41_tiers && llama_dsv41_topk_enabled()) {
-        LLAMA_LOG_INFO("%s: creating DSV4.1 plain-tier index-key cache, ratio %u, size = %u cells\n",
+        LLAMA_LOG_WARN("%s: creating DSV4.1 plain-tier index-key cache, ratio %u, size = %u cells (LLAMA_DSV41_TOPK=1)\n",
                 __func__, model.hparams.dsv4_ratio_plain, dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_plain));
 
         kv_lid_plain = std::make_unique<llama_kv_cache>(
