@@ -817,6 +817,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     if (k_rot) {
         q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
         kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+
+        // V4.1 selection: the indexer chain just before this may be pinned to the key owner's device, and the scheduler
+        // hands unpinned ops the device of the node before them; anchor the layer's own work back on its device
+        if (top_k) {
+            cb(q->src[0],  "dsv41_pin", il);
+            cb(kv->src[0], "dsv41_pin", il);
+        }
     }
 
     ggml_build_forward_expand(gf, q);
@@ -836,10 +843,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
 
     // V4.1 sparse compute: gather the picked rows and attend over those alone (see build_dsv41_sparse_attention)
     if (top_k && dsv41_sparse) {
-        GGML_ASSERT(dsv41_sel_mask && "sparse selection without the picks' validity mask");
+        GGML_ASSERT(dsv41_sel_k && dsv41_sel_mask && "sparse selection without the gathered picks");
 
-        ggml_tensor * out = build_dsv41_sparse_attention(q, raw_k, inp_attn->get_kq_mask(), hca_k,
-                top_k, dsv41_sel_mask, sinks, kq_scale, il);
+        ggml_tensor * out = build_dsv41_sparse_attention(q, raw_k, inp_attn->get_kq_mask(),
+                dsv41_sel_k, dsv41_sel_mask, sinks, kq_scale, il);
         if (k_rot) {
             out = llama_mul_mat_hadamard(ctx0, out, k_rot);
         }
@@ -1092,11 +1099,15 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_indexer_top_k(
         ggml_tensor * mask_f16 = mask->type == GGML_TYPE_F16 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F16);
         score = ggml_lightning_indexer(ctx0, q, k, w, mask_f16);
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        // score where the keys live: an index source after the key owner (24..36 read layer 20) would otherwise pull the
+        // whole key view across devices every step; q and w are small, the score is O(n_kv) floats
+        cb(score, "dsv41_pin", il_keys);
     } else {
         q = ggml_permute(ctx0, q, 0, 2, 1, 3);
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
 
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        cb(kq, "dsv41_pin", il_keys);
         kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
 
         score = ggml_relu(ctx0, kq);
@@ -1188,12 +1199,56 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sel_mask(
 // masked and padding rows contribute nothing. Padding to FATTN_KQ_STRIDE keeps the D=512 flash-attention kernels eligible.
 // Not bit-exact against the mask path on a quantized cache: the picks are dequantized once here, the mask path lets the
 // kernel dequantize; with an F16 cache the rows are identical and only the kernel's tiling differs.
+ggml_tensor * llama_model_deepseek4::graph::build_dsv41_gather_picks(
+        ggml_tensor * comp_k,
+        ggml_tensor * top_k,
+        int il_kv) const {
+    const int64_t n_embd_head = comp_k->ne[0];
+    const int64_t n_stream    = comp_k->ne[3];
+    const int64_t n_sel       = top_k->ne[0];
+    const int64_t nt          = top_k->ne[1];       // tokens per stream
+
+    GGML_ASSERT(comp_k->ne[1] == 1);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && ggml_is_contiguous(top_k) && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
+
+    // The scheduler places an op by its weights or by its neighbours, never by a KV cache it reads, and a view is not a
+    // node it looks at: left alone, this gather would land on the reader's device and the scheduler would copy the view it
+    // reads, which is the stream's entire cache, across every step (measured: flat 2.7 t/s whatever the context). Pinning
+    // each op here to the cache owner's device keeps the cache put; only the gathered rows travel.
+    ggml_tensor * res = nullptr;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        ggml_tensor * kc_s  = ggml_view_2d(ctx0, comp_k, n_embd_head, comp_k->ne[2], comp_k->nb[2], s*comp_k->nb[3]);
+        ggml_tensor * idx_s = ggml_view_1d(ctx0, top_k, n_sel*nt, s*top_k->nb[3]);
+
+        ggml_tensor * g_s = ggml_get_rows(ctx0, kc_s, idx_s); // F32 [n_embd_head, n_sel*nt]
+        cb(g_s, "dsv41_pin", il_kv);
+        g_s = ggml_reshape_3d(ctx0, g_s, n_embd_head, n_sel, nt);
+
+        if (res == nullptr) {
+            res = g_s;
+        } else {
+            res = ggml_concat(ctx0, res, g_s, 3);
+            cb(res, "dsv41_pin", il_kv);
+        }
+    }
+
+    // F16 before it travels: half the bytes, and flash attention wants F16 rows anyway
+    if (cparams.flash_attn) {
+        res = ggml_cast(ctx0, res, GGML_TYPE_F16);
+        cb(res, "dsv41_pin", il_kv);
+    }
+
+    res = ggml_reshape_4d(ctx0, res, n_embd_head, n_sel, nt, n_stream);
+    ggml_format_name(res, "dsv41_sel_k-%d", il_kv);
+
+    return res;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sparse_attention(
         ggml_tensor * q,
         ggml_tensor * raw_k,
         ggml_tensor * raw_mask,
-        ggml_tensor * comp_k,
-        ggml_tensor * top_k,
+        ggml_tensor * sel_k,
         ggml_tensor * sel_mask,
         ggml_tensor * sinks,
         float kq_scale,
@@ -1201,15 +1256,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sparse_attention(
     const int64_t n_embd_head = raw_k->ne[0];
     const int64_t n_raw       = raw_k->ne[2];
     const int64_t n_stream    = raw_k->ne[3];
-    const int64_t n_sel       = top_k->ne[0];
-    const int64_t nt          = top_k->ne[1];       // tokens per stream
+    const int64_t n_sel       = sel_k->ne[1];
+    const int64_t nt          = sel_k->ne[2];       // tokens per stream
     const int64_t n_batch     = nt*n_stream;
 
-    GGML_ASSERT(raw_k->ne[1] == 1 && comp_k->ne[1] == 1);
-    GGML_ASSERT(comp_k->ne[0] == n_embd_head && comp_k->ne[3] == n_stream);
+    GGML_ASSERT(raw_k->ne[1] == 1);
+    GGML_ASSERT(sel_k->ne[0] == n_embd_head && sel_k->ne[3] == n_stream && ggml_is_contiguous(sel_k));
     GGML_ASSERT(q->ne[0] == n_embd_head && q->ne[2] == n_batch);
     GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == nt && raw_mask->ne[2] == 1 && raw_mask->ne[3] == n_stream);
-    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && ggml_is_contiguous(top_k) && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
     GGML_ASSERT(sel_mask->type == GGML_TYPE_F32 && ggml_is_contiguous(sel_mask));
     GGML_ASSERT(sel_mask->ne[0] == n_sel && sel_mask->ne[1] == nt && sel_mask->ne[2] == 1 && sel_mask->ne[3] == n_stream);
 
@@ -1223,17 +1277,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sparse_attention(
     ggml_tensor * m_all = nullptr;
 
     for (int64_t s = 0; s < n_stream; ++s) {
-        // window rows, dequantized, then one copy per token of the stream: [n_embd_head, n_raw, nt]
+        // window rows of this layer's own cache (same device, no pin needed), dequantized, then one copy per token of the
+        // stream: [n_embd_head, n_raw, nt]
         ggml_tensor * kr_s = ggml_view_2d(ctx0, raw_k, n_embd_head, n_raw, raw_k->nb[2], s*raw_k->nb[3]);
         ggml_tensor * r_s  = ggml_get_rows(ctx0, kr_s, dsv41_raw_ids);
+        if (r_s->type != sel_k->type) {
+            r_s = ggml_cast(ctx0, r_s, sel_k->type);
+        }
         r_s = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, r_s, n_embd_head*n_raw, 1), n_embd_head*n_raw, nt, 1, 1);
         r_s = ggml_reshape_3d(ctx0, r_s, n_embd_head, n_raw, nt);
 
-        // the picks, per token: [n_embd_head, n_sel, nt]
-        ggml_tensor * kc_s  = ggml_view_2d(ctx0, comp_k, n_embd_head, comp_k->ne[2], comp_k->nb[2], s*comp_k->nb[3]);
-        ggml_tensor * idx_s = ggml_view_1d(ctx0, top_k, n_sel*nt, s*top_k->nb[3]);
-        ggml_tensor * g_s   = ggml_get_rows(ctx0, kc_s, idx_s);
-        g_s = ggml_reshape_3d(ctx0, g_s, n_embd_head, n_sel, nt);
+        // the picks, gathered once at the index source: [n_embd_head, n_sel, nt]
+        ggml_tensor * g_s = ggml_view_3d(ctx0, sel_k, n_embd_head, n_sel, nt, sel_k->nb[1], sel_k->nb[2], s*sel_k->nb[3]);
 
         ggml_tensor * k_s = ggml_concat(ctx0, r_s, g_s, 1);
 
@@ -1259,15 +1314,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sparse_attention(
     if (n_kv_pad != n_kv_sel) {
         const int64_t n_pad = n_kv_pad - n_kv_sel;
         k_all = ggml_concat(ctx0, k_all,
-                ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd_head, 1, n_pad, n_batch), 0.0f), 2);
+                ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, k_all->type, n_embd_head, 1, n_pad, n_batch), 0.0f), 2);
         m_all = ggml_concat(ctx0, m_all,
                 ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pad, 1, 1, n_batch), -INFINITY), 0);
         n_kv_sel = n_kv_pad;
     }
-    // flash attention takes F16 rows and an F16 mask; cast K once here rather than letting build_attn_mha() cast K and V
-    // separately, since they are the same tensor
+
+    // K is already F16 under flash attention (the picks were cast where they were gathered, the window rows above); the
+    // mask follows, contiguous as ggml_flash_attn_ext requires
     if (cparams.flash_attn) {
-        k_all = ggml_cast(ctx0, k_all, GGML_TYPE_F16);
+        GGML_ASSERT(k_all->type == GGML_TYPE_F16);
         m_all = ggml_cast(ctx0, m_all, GGML_TYPE_F16);
     }
     cb(k_all, "dsv41_sparse_k", il);
@@ -1719,6 +1775,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         if (hparams.dsv41_is_index_source(il)) {
             dsv41_top_k       = build_dsv41_indexer_top_k(model, inp_dsv4, tier, lid_ctx, kv_src, qr, cur, inp_pos, il);
             dsv41_top_k_ratio = ratio;
+
+            // gather path: pull the picks out of the source's cache once, on the source's device, for every layer up to the
+            // next index source
+            if (dsv41_sparse) {
+                const auto * comp_ctx = (v41 && tier_idx) ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca();
+                dsv41_sel_k = build_dsv41_gather_picks(comp_ctx->get_k(ctx0, kv_src), dsv41_top_k, kv_src);
+            }
         }
         GGML_ASSERT(dsv41_top_k && "LLAMA_DSV41_TOPK: compressed layer before the first index source");
         GGML_ASSERT(dsv41_top_k_ratio == ratio && "LLAMA_DSV41_TOPK: reused top-k indexes a different compressed tier");

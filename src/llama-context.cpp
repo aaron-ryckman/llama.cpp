@@ -3171,6 +3171,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
             }
         }
+
+        // DeepSeek-V4.1 sparse selection: an op that reads another layer's KV cache has to run where that cache lives, or
+        // the scheduler, which places by weights and neighbours and never by a cache, puts it on the reader's device and
+        // copies the whole cache view there every step. Here il names the layer that owns the data, whatever the batch.
+        if (il != -1 && strcmp(name, "dsv41_pin") == 0) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer && ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                }
+            }
+        }
     };
 }
 

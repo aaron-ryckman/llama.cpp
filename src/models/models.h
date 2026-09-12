@@ -1362,6 +1362,7 @@ struct llama_model_deepseek4 : public llama_model_base {
         // into a compact K/V and attend over those. Taken when the ubatch is small (decode); prefill keeps the mask path.
         // The index source publishes the 0/-inf validity of its picks alongside them; the window row ids are built once per graph.
         mutable bool          dsv41_sparse   = false;
+        mutable ggml_tensor * dsv41_sel_k    = nullptr; // F16 (F32 without flash attention) [n_embd_head, n_top_k, n_tokens/n_stream, n_stream]
         mutable ggml_tensor * dsv41_sel_mask = nullptr; // F32 [n_top_k, n_tokens/n_stream, 1, n_stream]
         mutable ggml_tensor * dsv41_raw_ids  = nullptr; // I32 [n_raw]
 
@@ -1371,14 +1372,21 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * top_k,
                 int il) const;
 
-        // q [n_embd_head, n_head, n_tokens]; raw_k/comp_k are the cache views [n_embd_head, 1, n_rows, n_stream];
-        // raw_mask [n_raw, n_tokens/n_stream, 1, n_stream]; top_k I32 and sel_mask F32 [n_top_k, n_tokens/n_stream, 1, n_stream].
+        // The picks pulled out of the source's compressed cache, once per index source and shared by the layers that reuse its
+        // picks. comp_k is the cache view [n_embd_head, 1, n_rows, n_stream] of layer il_kv; the gather is pinned to that layer's
+        // device, so only the gathered rows cross devices, never the cache.
+        ggml_tensor * build_dsv41_gather_picks(
+                ggml_tensor * comp_k,
+                ggml_tensor * top_k,
+                int il_kv) const;
+
+        // q [n_embd_head, n_head, n_tokens]; raw_k is this layer's window cache view [n_embd_head, 1, n_raw, n_stream];
+        // raw_mask [n_raw, n_tokens/n_stream, 1, n_stream]; sel_k from build_dsv41_gather_picks(); sel_mask F32 [n_top_k, n_tokens/n_stream, 1, n_stream].
         ggml_tensor * build_dsv41_sparse_attention(
                 ggml_tensor * q,
                 ggml_tensor * raw_k,
                 ggml_tensor * raw_mask,
-                ggml_tensor * comp_k,
-                ggml_tensor * top_k,
+                ggml_tensor * sel_k,
                 ggml_tensor * sel_mask,
                 ggml_tensor * sinks,
                 float kq_scale,
