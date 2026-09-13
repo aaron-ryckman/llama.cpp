@@ -1165,18 +1165,27 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sel_mask(
     GGML_ASSERT(top_k->ne[1] == nt && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
 
     // get_rows gathers rows, and the CUDA kernel wants rows of an even width, so each mask entry is doubled into a 2-wide
-    // row first; per stream the gather is batched over the tokens (a->ne[2] == b->ne[1]) and column 0 is kept
-    ggml_tensor * m2 = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, mask_f32, 1, n_kv, nt, n_stream), 2, n_kv, nt, n_stream);
+    // row first; per stream the gather is batched over the tokens (a->ne[2] == b->ne[1]) and column 0 is kept. The 2-wide
+    // copy is rows x tokens, so a prefill ubatch builds it a token chunk at a time (llama_dsv41_sparse_chunk)
+    const int64_t chunk = llama_dsv41_sparse_chunk() > 0 ? std::min<int64_t>(llama_dsv41_sparse_chunk(), nt) : nt;
 
     ggml_tensor * res = nullptr;
     for (int64_t s = 0; s < n_stream; ++s) {
-        ggml_tensor * a = ggml_view_3d(ctx0, m2, 2, n_kv, nt, m2->nb[1], m2->nb[2], s*m2->nb[3]);
-        ggml_tensor * b = ggml_view_2d(ctx0, top_k, n_sel, nt, top_k->nb[1], s*top_k->nb[3]);
+        ggml_tensor * res_s = nullptr;
+        for (int64_t t0 = 0; t0 < nt; t0 += chunk) {
+            const int64_t c = std::min<int64_t>(chunk, nt - t0);
 
-        ggml_tensor * g = ggml_get_rows(ctx0, a, b); // F32 [2, n_sel, nt]
-        g = ggml_cont(ctx0, ggml_view_3d(ctx0, g, 1, n_sel, nt, g->nb[1], g->nb[2], 0));
+            ggml_tensor * m = ggml_view_2d(ctx0, mask_f32, n_kv, c, mask_f32->nb[1], s*mask_f32->nb[3] + t0*mask_f32->nb[1]);
+            ggml_tensor * a = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, m, 1, n_kv, c), 2, n_kv, c, 1);
+            ggml_tensor * b = ggml_view_2d(ctx0, top_k, n_sel, c, top_k->nb[1], s*top_k->nb[3] + t0*top_k->nb[1]);
 
-        res = res ? ggml_concat(ctx0, res, g, 3) : g;
+            ggml_tensor * g = ggml_get_rows(ctx0, a, b); // F32 [2, n_sel, c]
+            g = ggml_cont(ctx0, ggml_view_3d(ctx0, g, 1, n_sel, c, g->nb[1], g->nb[2], 0));
+
+            res_s = res_s ? ggml_concat(ctx0, res_s, g, 2) : g;
+        }
+
+        res = res ? ggml_concat(ctx0, res, res_s, 3) : res_s;
     }
 
     res = ggml_reshape_4d(ctx0, res, n_sel, nt, 1, n_stream);
@@ -1215,14 +1224,36 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_gather_picks(
     // node it looks at: left alone, this gather would land on the reader's device and the scheduler would copy the view it
     // reads, which is the stream's entire cache, across every step (measured: flat 2.7 t/s whatever the context). Pinning
     // each op here to the cache owner's device keeps the cache put; only the gathered rows travel.
+    // A prefill ubatch gathers a token chunk at a time (llama_dsv41_sparse_chunk) and casts each chunk before the next, so the
+    // F32 rows never exist for the whole ubatch at once; F16 before it travels: half the bytes, and flash attention wants
+    // F16 rows anyway
+    const int64_t chunk = llama_dsv41_sparse_chunk() > 0 ? std::min<int64_t>(llama_dsv41_sparse_chunk(), nt) : nt;
+
     ggml_tensor * res = nullptr;
     for (int64_t s = 0; s < n_stream; ++s) {
-        ggml_tensor * kc_s  = ggml_view_2d(ctx0, comp_k, n_embd_head, comp_k->ne[2], comp_k->nb[2], s*comp_k->nb[3]);
-        ggml_tensor * idx_s = ggml_view_1d(ctx0, top_k, n_sel*nt, s*top_k->nb[3]);
+        ggml_tensor * kc_s = ggml_view_2d(ctx0, comp_k, n_embd_head, comp_k->ne[2], comp_k->nb[2], s*comp_k->nb[3]);
 
-        ggml_tensor * g_s = ggml_get_rows(ctx0, kc_s, idx_s); // F32 [n_embd_head, n_sel*nt]
-        cb(g_s, "dsv41_pin", il_kv);
-        g_s = ggml_reshape_3d(ctx0, g_s, n_embd_head, n_sel, nt);
+        ggml_tensor * g_s = nullptr;
+        for (int64_t t0 = 0; t0 < nt; t0 += chunk) {
+            const int64_t c = std::min<int64_t>(chunk, nt - t0);
+
+            ggml_tensor * idx_c = ggml_view_1d(ctx0, top_k, n_sel*c, s*top_k->nb[3] + t0*top_k->nb[1]);
+
+            ggml_tensor * g_c = ggml_get_rows(ctx0, kc_s, idx_c); // F32 [n_embd_head, n_sel*c]
+            cb(g_c, "dsv41_pin", il_kv);
+            if (cparams.flash_attn) {
+                g_c = ggml_cast(ctx0, g_c, GGML_TYPE_F16);
+                cb(g_c, "dsv41_pin", il_kv);
+            }
+            g_c = ggml_reshape_3d(ctx0, g_c, n_embd_head, n_sel, c);
+
+            if (g_s == nullptr) {
+                g_s = g_c;
+            } else {
+                g_s = ggml_concat(ctx0, g_s, g_c, 2);
+                cb(g_s, "dsv41_pin", il_kv);
+            }
+        }
 
         if (res == nullptr) {
             res = g_s;
@@ -1230,12 +1261,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_gather_picks(
             res = ggml_concat(ctx0, res, g_s, 3);
             cb(res, "dsv41_pin", il_kv);
         }
-    }
-
-    // F16 before it travels: half the bytes, and flash attention wants F16 rows anyway
-    if (cparams.flash_attn) {
-        res = ggml_cast(ctx0, res, GGML_TYPE_F16);
-        cb(res, "dsv41_pin", il_kv);
     }
 
     res = ggml_reshape_4d(ctx0, res, n_embd_head, n_sel, nt, n_stream);
@@ -1271,6 +1296,69 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_sparse_attention(
     if (dsv41_raw_ids == nullptr || dsv41_raw_ids->ne[0] != n_raw) {
         dsv41_raw_ids = ggml_argsort(ctx0, ggml_arange(ctx0, 0.0f, (float) n_raw, 1.0f), GGML_SORT_ORDER_ASC);
         cb(dsv41_raw_ids, "dsv41_raw_ids", -1);
+    }
+
+    // A prefill ubatch attends a token chunk at a time (llama_dsv41_sparse_chunk): the per-token K below is
+    // n_embd_head x (n_raw + n_sel, padded) x tokens, ~1.3 GB of F16 for a 512-token ubatch before flash attention even
+    // starts, which is what keeps the gather from fitting beside a full layer split. Every query attends over its own rows
+    // only, so the chunks compute exactly what the whole ubatch would; the outputs are concatenated in query order.
+    const int64_t chunk = llama_dsv41_sparse_chunk();
+    if (chunk > 0 && nt > chunk) {
+        GGML_ASSERT(q->ne[3] == 1);
+
+        ggml_tensor * out = nullptr;
+        for (int64_t s = 0; s < n_stream; ++s) {
+            ggml_tensor * kr_s = ggml_view_2d(ctx0, raw_k, n_embd_head, n_raw, raw_k->nb[2], s*raw_k->nb[3]);
+            ggml_tensor * r_s  = ggml_get_rows(ctx0, kr_s, dsv41_raw_ids);
+            if (r_s->type != sel_k->type) {
+                r_s = ggml_cast(ctx0, r_s, sel_k->type);
+            }
+            r_s = ggml_reshape_2d(ctx0, r_s, n_embd_head*n_raw, 1);
+
+            for (int64_t t0 = 0; t0 < nt; t0 += chunk) {
+                const int64_t c = std::min<int64_t>(chunk, nt - t0);
+
+                ggml_tensor * r_c = ggml_repeat_4d(ctx0, r_s, n_embd_head*n_raw, c, 1, 1);
+                r_c = ggml_reshape_3d(ctx0, r_c, n_embd_head, n_raw, c);
+
+                ggml_tensor * g_c = ggml_view_3d(ctx0, sel_k, n_embd_head, n_sel, c,
+                        sel_k->nb[1], sel_k->nb[2], s*sel_k->nb[3] + t0*sel_k->nb[2]);
+                ggml_tensor * k_c = ggml_concat(ctx0, r_c, g_c, 1);
+
+                ggml_tensor * rm_c = ggml_cast(ctx0,
+                        ggml_view_2d(ctx0, raw_mask, n_raw, c, raw_mask->nb[1], s*raw_mask->nb[3] + t0*raw_mask->nb[1]), GGML_TYPE_F32);
+                ggml_tensor * sm_c = ggml_cont(ctx0,
+                        ggml_view_2d(ctx0, sel_mask, n_sel, c, sel_mask->nb[1], s*sel_mask->nb[3] + t0*sel_mask->nb[1]));
+                ggml_tensor * m_c = ggml_concat(ctx0, rm_c, sm_c, 0);
+
+                int64_t n_kv_c = n_raw + n_sel;
+                k_c = ggml_reshape_4d(ctx0, k_c, n_embd_head, 1, n_kv_c, c);
+                m_c = ggml_reshape_4d(ctx0, m_c, n_kv_c, 1, 1, c);
+
+                const int64_t n_kv_pad = GGML_PAD(n_kv_c, 256);
+                if (n_kv_pad != n_kv_c) {
+                    const int64_t n_pad = n_kv_pad - n_kv_c;
+                    k_c = ggml_concat(ctx0, k_c,
+                            ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, k_c->type, n_embd_head, 1, n_pad, c), 0.0f), 2);
+                    m_c = ggml_concat(ctx0, m_c,
+                            ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pad, 1, 1, c), -INFINITY), 0);
+                }
+
+                if (cparams.flash_attn) {
+                    GGML_ASSERT(k_c->type == GGML_TYPE_F16);
+                    m_c = ggml_cast(ctx0, m_c, GGML_TYPE_F16);
+                }
+                cb(k_c, "dsv41_sparse_k", il);
+                cb(m_c, "dsv41_sparse_mask", il);
+
+                ggml_tensor * q_c = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], c, q->nb[1], q->nb[2], (s*nt + t0)*q->nb[2]);
+
+                ggml_tensor * o_c = build_attn_mha(q_c, k_c, k_c, nullptr, m_c, sinks, nullptr, kq_scale, il);
+                out = out ? ggml_concat(ctx0, out, o_c, 1) : o_c;
+            }
+        }
+
+        return out;
     }
 
     ggml_tensor * k_all = nullptr;

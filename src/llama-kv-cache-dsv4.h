@@ -23,6 +23,11 @@ bool llama_dsv41_topk_enabled();
 // scans few rows, and under 512 rows the selection keeps every row anyway.
 int64_t llama_dsv41_sparse_max_tokens();
 int64_t llama_dsv41_sparse_min_rows();
+// Token chunk for the gather's large intermediates (LLAMA_DSV41_SPARSE_CHUNK, default 128; 0 = whole ubatch). A prefill
+// ubatch through the gather would otherwise materialize one K of window + picks per token for the whole ubatch at once
+// (~1.3 GB per reader layer at 512 tokens, and a 2 x rows x tokens mask copy at each index source); chunking bounds that
+// to the chunk and changes no value, since every query attends over its own rows only.
+int64_t llama_dsv41_sparse_chunk();
 
 // Logs the state (raw value and effect) at WARN so the field sees it at default verbosity. Logs on
 // every call, never once: the model is loaded both by the fitter's trial and for real.
