@@ -1492,15 +1492,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     const bool topk_on = v41 && ratio != 0 && inp_dsv4 != nullptr && !compress_off && llama_dsv41_topk_enabled();
     const llama_kv_cache_dsv4_comp_context * lid_ctx = nullptr;
 
-    // Sparse compute (gather) up to this many tokens per ubatch; larger ubatches (prefill) keep the mask path, because the
-    // gather materializes n_top_k rows per token (512 x 512 x 4 B = 1 MiB per token per layer, plus the F16 copy).
-    // LLAMA_DSV41_SPARSE_MAX_TOKENS overrides; 0 keeps the mask path everywhere.
-    static const int64_t sparse_max_tokens = [] {
-        const char * e = getenv("LLAMA_DSV41_SPARSE_MAX_TOKENS");
-        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 32;
-    }();
-    dsv41_sparse = topk_on && nt <= sparse_max_tokens;
-
     if (topk_on) {
         // each tier's index keys sit in a cache that mirrors that tier's compressed cache
         lid_ctx = tier_idx ? inp_dsv4->mctx->get_lid() : inp_dsv4->mctx->get_lid_plain();
@@ -1512,6 +1503,23 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     const auto & tier   = inp_dsv4 ? (v41 && tier_idx ? inp_dsv4->get_csa() : inp_dsv4->get_hca())
                                    : inp_dsv4->get_hca();
     const int64_t tier_ratio = ratio;
+
+    // Sparse compute (gather) or mask. The gather runs on small ubatches only: it materializes n_top_k rows per token
+    // (512 x 512 x 4 B = 1 MiB per token per layer, plus the F16 copy), so prefill keeps the mask path. And only on a tier
+    // with enough rows: the mask path's cost grows with the rows, the gather's does not, and on a short tier the mask
+    // path is cheaper (llama_dsv41_sparse_min_rows). Decided on an index source and inherited by the layers that reuse its
+    // picks, which read the same tier; the tier's row count is part of the graph-reuse check (dsv4_can_reuse_kq_mask), so
+    // a reused graph never carries the other path.
+    if (!topk_on) {
+        dsv41_sparse = false;
+    } else if (hparams.dsv41_is_index_source(il)) {
+        const int64_t n_rows = tier.kq_mask ? tier.kq_mask->ne[0] : 0;
+        dsv41_sparse = nt <= llama_dsv41_sparse_max_tokens() && n_rows >= llama_dsv41_sparse_min_rows();
+        if (!dsv41_sparse) {
+            dsv41_sel_k    = nullptr;
+            dsv41_sel_mask = nullptr;
+        }
+    }
 
     ggml_tensor * hca_state_kv    = nullptr;
     ggml_tensor * hca_state_score = nullptr;

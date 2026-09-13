@@ -25,6 +25,12 @@ static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
+// Compressed rows from which the sparse gather beats the mask path at decode (llama_dsv41_sparse_min_rows). Measured on
+// 8x MI50, one stream, 128-token decodes (2026-09-12): mask / gather = 11.3 / 10.5 t/s at 1.1k tokens, 10.6 / 10.6 at
+// 3.2k, 9.7 / 10.2 at 6.6k, 8.9 / 10.4 at 13k. The tie at 3.2k tokens has the ratio 1 tier at 3.2k rows and the ratio 2
+// tier at 1.6k, so the per-tier break-even is in between; rows are padded to 256.
+static constexpr int64_t DSV41_SPARSE_MIN_ROWS_DEFAULT = 2048;
+
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
@@ -37,10 +43,32 @@ bool llama_dsv41_topk_enabled() {
     return on;
 }
 
+static int64_t dsv41_env_int64(const char * name, int64_t def) {
+    const char * e = getenv(name);
+    return e != nullptr ? (int64_t) atoll(e) : def;
+}
+
+int64_t llama_dsv41_sparse_max_tokens() {
+    static const int64_t v = dsv41_env_int64("LLAMA_DSV41_SPARSE_MAX_TOKENS", 32);
+    return v;
+}
+
+int64_t llama_dsv41_sparse_min_rows() {
+    static const int64_t v = dsv41_env_int64("LLAMA_DSV41_SPARSE_MIN_ROWS", DSV41_SPARSE_MIN_ROWS_DEFAULT);
+    return v;
+}
+
 void llama_dsv41_topk_log_state(const char * where) {
     const char * e = getenv("LLAMA_DSV41_TOPK");
     if (llama_dsv41_topk_enabled()) {
         LLAMA_LOG_WARN("deepseek41: %s: LLAMA_DSV41_TOPK=%s, sparse top-k selection over the compressed stream enabled (prototype)\n", where, e ? e : "?");
+        if (llama_dsv41_sparse_max_tokens() > 0) {
+            LLAMA_LOG_WARN("deepseek41: %s: sparse gather for ubatches of <= %lld tokens on tiers of >= %lld compressed rows, mask path otherwise "
+                           "(LLAMA_DSV41_SPARSE_MAX_TOKENS / LLAMA_DSV41_SPARSE_MIN_ROWS)\n",
+                           where, (long long) llama_dsv41_sparse_max_tokens(), (long long) llama_dsv41_sparse_min_rows());
+        } else {
+            LLAMA_LOG_WARN("deepseek41: %s: LLAMA_DSV41_SPARSE_MAX_TOKENS=0, top-k applied as a mask everywhere\n", where);
+        }
     } else if (e != nullptr) {
         LLAMA_LOG_WARN("deepseek41: %s: LLAMA_DSV41_TOPK='%s' is not a nonzero integer, sparse top-k selection stays off\n", where, e);
     } else {

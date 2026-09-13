@@ -16,6 +16,14 @@
 // log callback demotes everything to DEBUG, and a log-once there is lost for good.
 bool llama_dsv41_topk_enabled();
 
+// Sparse compute (gather) for the selection, both read from the environment once and silent (same reason):
+// the gather runs on ubatches of at most llama_dsv41_sparse_max_tokens() tokens (LLAMA_DSV41_SPARSE_MAX_TOKENS,
+// default 32; 0 keeps the mask path everywhere) and only on a compressed tier holding at least
+// llama_dsv41_sparse_min_rows() rows (LLAMA_DSV41_SPARSE_MIN_ROWS). Below that the mask path is cheaper: it
+// scans few rows, and under 512 rows the selection keeps every row anyway.
+int64_t llama_dsv41_sparse_max_tokens();
+int64_t llama_dsv41_sparse_min_rows();
+
 // Logs the state (raw value and effect) at WARN so the field sees it at default verbosity. Logs on
 // every call, never once: the model is loaded both by the fitter's trial and for real.
 void llama_dsv41_topk_log_state(const char * where);
