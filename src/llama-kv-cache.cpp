@@ -1821,8 +1821,10 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 bool llama_kv_cache::has_cell_ext() const {
-    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+    // M-RoPE needs the 2D position, the PLE and Engram n-gram hashes need the token id. apply_ubatch() stores the token
+    // for any token ubatch, but only has_cell_ext() makes it survive a state write/read: without the Engram term a
+    // restored DeepSeek-V4.1 cell came back with token 0 and the next tokens' n-gram look-back hashed garbage.
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.engram_n_layers > 0;
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
