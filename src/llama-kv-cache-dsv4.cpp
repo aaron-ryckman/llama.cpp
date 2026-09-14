@@ -64,6 +64,11 @@ int64_t llama_dsv41_sparse_chunk() {
     return v;
 }
 
+bool llama_dsv41_checkpoints_enabled() {
+    static const bool on = dsv41_env_int64("LLAMA_DSV41_CHECKPOINTS", 0) != 0;
+    return on;
+}
+
 void llama_dsv41_topk_log_state(const char * where) {
     const char * e = getenv("LLAMA_DSV41_TOPK");
     if (llama_dsv41_topk_enabled()) {
@@ -1453,6 +1458,16 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, offload, unified_compressed, n_seq_max, model.hparams.dsv4_ratio_idx, idx_state,
             idx_embd_mul*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
+    // WARN on every construction (the fitter's trial one included), same reason as the top-k line above.
+    if (llama_dsv41_checkpoints_enabled()) {
+        can_checkpoint = v41_tiers;
+        if (v41_tiers) {
+            LLAMA_LOG_WARN("%s: LLAMA_DSV41_CHECKPOINTS=1, prompt checkpoints enabled for the DSV4.1 cache (prototype)\n", __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_DSV41_CHECKPOINTS set but this is not a V4.1 cache, prompt checkpoints stay off\n", __func__);
+        }
+    }
+
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
@@ -1577,9 +1592,13 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
 }
 
 bool llama_kv_cache_dsv4::get_can_checkpoint() const {
-    // The compressed attention state cannot currently be restored losslessly
-    // from a partial sequence checkpoint.
-    return false;
+    // V4 (and V4.1 without LLAMA_DSV41_CHECKPOINTS) keeps refusing: unvalidated there. For V4.1 a partial checkpoint
+    // at position C restores the raw window cells (token ids included) and the compressor / indexer partial-group
+    // states exactly as they were before the batch starting at C; the server then calls seq_rm(C, -1), which takes
+    // the p0 > pos_max branch below and truncates every compressed tier to floor(C/ratio) rows. Compressed rows are
+    // written and made visible by position only (plan state_write_idxs / n_visible), so stale rows past the
+    // truncation are overwritten before any query can see them.
+    return can_checkpoint;
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {

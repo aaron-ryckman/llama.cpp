@@ -2225,6 +2225,21 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         THINK_END,
     };
 
+    // Message starts for the server's prompt checkpoints (a mid-prompt checkpoint lands where a user message starts).
+    // V4.1 only, and only under LLAMA_DSV41_CHECKPOINTS=1: the server splits prompt batches at these starts whenever
+    // its checkpoint policy is on, which a cache that cannot restore them would pay for without any use. Tool results
+    // render inside the user turn and a mid-conversation system message starts with its own token.
+    if (is_v41) {
+        const char * ckpt = getenv("LLAMA_DSV41_CHECKPOINTS");
+        if (ckpt != nullptr && atoi(ckpt) != 0) {
+            data.message_delimiters = {
+                { COMMON_CHAT_ROLE_USER,      "<｜User｜>"      },
+                { COMMON_CHAT_ROLE_ASSISTANT, GEN_PROMPT         },
+                { COMMON_CHAT_ROLE_SYSTEM,    "<｜System｜>"    },
+            };
+        }
+    }
+
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 

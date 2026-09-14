@@ -29,6 +29,14 @@ int64_t llama_dsv41_sparse_min_rows();
 // to the chunk and changes no value, since every query attends over its own rows only.
 int64_t llama_dsv41_sparse_chunk();
 
+// LLAMA_DSV41_CHECKPOINTS=1 lets the server keep prompt checkpoints for a V4.1 cache, so a request that diverges
+// before the end of the cached prompt (compaction, retry, an edited tool result) resumes from the nearest
+// checkpoint instead of re-prefilling from token 0. A partial checkpoint holds the raw sliding-window cells
+// (with their token ids, which the Engram hash reads) and the compressor / indexer partial-group states; the
+// compressed rows are append-only and positional, so the server's seq_rm(p0) after the restore truncates them.
+// Read once and silent (same auto-fitter reason as above); the cache constructor logs the state.
+bool llama_dsv41_checkpoints_enabled();
+
 // Logs the state (raw value and effect) at WARN so the field sees it at default verbosity. Logs on
 // every call, never once: the model is loaded both by the fitter's trial and for real.
 void llama_dsv41_topk_log_state(const char * where);
@@ -190,6 +198,9 @@ private:
 
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
+
+    // V4.1 + LLAMA_DSV41_CHECKPOINTS only
+    bool can_checkpoint = false;
 
     std::vector<uint32_t> rs_idx;
 
