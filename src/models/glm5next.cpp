@@ -4,6 +4,9 @@
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache-kpool.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 // ssm_a holds -exp(A_log) (kimi-k3), not +exp(A_log) (bailingmoe3); converter checks
 
 static uint32_t glm5next_n_select(const llama_hparams & hparams) {
@@ -416,47 +419,118 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(d_idx*n_ihead)));
     cb(w, "indexer_weights", il);
 
-    ggml_tensor * pool_score = nullptr;
-
-    if (cparams.fused_lid) {
-        // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
-        ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
-
-        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
-        cb(pool_score, "indexer_pool_score", il);
-
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
-
-        pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
-    } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, ggml_permute(ctx0, iq, 0, 2, 1, 3));
-
-        // the ReLU sits BETWEEN the per-head dot and the head weighting; either side differs
-        kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
-        ggml_tensor * score = ggml_relu(ctx0, kq);
-        cb(score, "indexer_score", il);
-
-        pool_score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, w));
-        pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
-        pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
-
-        pool_score = ggml_add(ctx0, pool_score, inp_kp->pool_bias);
-        cb(pool_score, "indexer_pool_score", il);
-    }
-
     // top-k over POOLS then expand: a cell-level top-k is wrong, relu ties span pool bounds
     const int64_t select_k = llama_kpool_select_k(n_pools, hparams.indexer_top_k, r);
     GGML_ASSERT(select_k > 0 && select_k <= n_pools);
 
-    ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
-    cb(sel, "indexer_top_k_pools", il);
+    ggml_tensor * pc3 = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
 
-    ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
-    ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
+    // [TAG_IDX_CHUNK] Port of ggml-org PR #27752 dba32211 ("llama: chunk the glm5next DSA indexer
+    // over tokens") onto this tree's indexer.
+    //
+    // On the UNFUSED path the per-head scores are materialised twice - once by the mul_mat as
+    // [n_pools, n_tps, n_ihead] and once by the permute+cont that puts the head axis in ne[0] for
+    // the reduction - i.e. 2*n_pools*n_ihead*n_tps*4 B, and per device, because the DSA layers are
+    // spread across the trunk. With kpool 4 and 32 indexer heads that is 16 B * n_kv per token, so
+    // 16 MiB/token at n_ctx 262144, which is what caps ubatch upstream.
+    //
+    // Scoring a token reads only its own query row and the pooled keys, which are shared across the
+    // batch, and nothing in this path reduces across tokens - so the token loop splits into chunks
+    // with identical results and ggml-alloc reuses one scratch buffer across them.
+    //
+    // NOTE for this tree: the default path here is the FUSED lightning indexer, whose kernel never
+    // materialises the per-head scores at all (its output is [n_pools, n_tps], 64x smaller). So the
+    // chunking is wired to the unfused path only, where the problem it solves actually exists.
+    // GLM53_IDX_CHUNK_MB sets the scratch target in MiB; unset/0 keeps the previous code path.
+    int64_t idx_chunk = n_tps;
+    if (!cparams.fused_lid) {
+        static const int64_t chunk_mb = []() {
+            const char * e = getenv("GLM53_IDX_CHUNK_MB");
+            const int64_t v = e ? atoll(e) : 0;
+            return v > 0 ? v : 0;
+        }();
+        if (chunk_mb > 0) {
+            const int64_t per_step = 2*n_pools*n_ihead*n_stream*(int64_t) sizeof(float);
+            idx_chunk = std::max<int64_t>(1, std::min<int64_t>(n_tps, (chunk_mb << 20)/std::max<int64_t>(1, per_step)));
+        }
+    }
 
-    ggml_tensor * top_k = ggml_get_rows(ctx0, pc3, sel_flat);
-    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
-    top_k = ggml_reshape_3d(ctx0, top_k, r*select_k, n_tps, n_stream);
+    ggml_tensor * top_k = nullptr;
+
+    for (int64_t t0 = 0; t0 < n_tps; t0 += idx_chunk) {
+        const int64_t nc = std::min<int64_t>(idx_chunk, n_tps - t0);
+        const bool whole = (nc == n_tps);
+
+        ggml_tensor * iq_c   = iq;
+        ggml_tensor * w_c    = w;
+        ggml_tensor * bias_c = inp_kp->pool_bias;
+        ggml_tensor * biasf_c = inp_kp->pool_bias_f16;
+
+        if (!whole) {
+            // the token axis is ne[2] of iq and ne[1] of w / pool_bias; strides are kept, so the
+            // slice stays correct for n_stream > 1 where a token range is not contiguous
+            iq_c = ggml_view_4d(ctx0, iq, d_idx, n_ihead, nc, n_stream,
+                    iq->nb[1], iq->nb[2], iq->nb[3], (size_t) t0*iq->nb[2]);
+            w_c = ggml_view_4d(ctx0, w, n_ihead, nc, 1, n_stream,
+                    w->nb[1], w->nb[2], w->nb[3], (size_t) t0*w->nb[1]);
+            bias_c = ggml_view_3d(ctx0, inp_kp->pool_bias, n_pools, nc, n_stream,
+                    inp_kp->pool_bias->nb[1], inp_kp->pool_bias->nb[2],
+                    (size_t) t0*inp_kp->pool_bias->nb[1]);
+            if (biasf_c) {
+                biasf_c = ggml_view_4d(ctx0, inp_kp->pool_bias_f16, n_pools, nc, 1, n_stream,
+                        inp_kp->pool_bias_f16->nb[1], inp_kp->pool_bias_f16->nb[2],
+                        inp_kp->pool_bias_f16->nb[3], (size_t) t0*inp_kp->pool_bias_f16->nb[1]);
+            }
+        }
+
+        ggml_tensor * pool_score = nullptr;
+
+        if (cparams.fused_lid) {
+            // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
+            ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
+
+            pool_score = ggml_lightning_indexer(ctx0, iq_c, pool_kf, w_c, biasf_c);
+            if (whole) {
+                cb(pool_score, "indexer_pool_score", il);
+            }
+
+            res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
+
+            pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, nc, n_stream);
+        } else {
+            ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, ggml_permute(ctx0, iq_c, 0, 2, 1, 3));
+
+            // the ReLU sits BETWEEN the per-head dot and the head weighting; either side differs
+            kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
+            ggml_tensor * score = ggml_relu(ctx0, kq);
+
+            pool_score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, w_c));
+            pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
+            pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, nc, n_stream);
+
+            pool_score = ggml_add(ctx0, pool_score, bias_c);
+            if (whole) {
+                cb(score,      "indexer_score", il);
+                cb(pool_score, "indexer_pool_score", il);
+            }
+        }
+
+        ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
+        if (whole) {
+            cb(sel, "indexer_top_k_pools", il);
+        }
+
+        ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*nc, n_stream);
+
+        ggml_tensor * tk = ggml_get_rows(ctx0, pc3, sel_flat);
+        GGML_ASSERT(tk->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
+        tk = ggml_reshape_3d(ctx0, tk, r*select_k, nc, n_stream);
+
+        // appends this chunk's tokens along the token axis; earlier chunks are recopied each
+        // iteration, which is negligible I32 traffic next to the scoring GEMMs
+        top_k = top_k ? ggml_concat(ctx0, top_k, tk, 1) : tk;
+    }
+
     cb(top_k, "indexer_top_k", il);
 
     return top_k;
