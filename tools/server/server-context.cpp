@@ -1238,6 +1238,9 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        // [TRIMTRACE] settle FULL vs PART by observation instead of inference
+        SRV_INF("TRIMTRACE: ctx_tgt_seq_rm_type = %d (0=NO 1=PART 2=FULL 3=RS), n_rs_seq = %u, n_swa = %d\n",
+                (int) ctx_tgt_seq_rm_type, llama_n_rs_seq(ctx_tgt), n_swa);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -3506,6 +3509,16 @@ private:
                     // divergence. A real divergence has cached tokens beyond p0 (token list longer than p0).
                     const bool prefix_covers_cache = (size_t) p0 >= slot.prompt.tokens.size();
                     const bool nothing_beyond = pos_max_cur < p0 || (prefix_covers_cache && pos_max_cur <= p0);
+                    // [TRIMTRACE] Which branch actually runs, and the values that decided it.
+                    // Read-only: no probe call, because any seq_rm here risks mutating the memory
+                    // under measurement. "does the trim fail?" is answered without one - the TRIM
+                    // branch goes through common_context_seq_rm, which GGML_ABORTs on false, so a
+                    // TRIM line followed by a live server means that trim succeeded.
+                    SLT_INF(slot, "TRIMTRACE: p0=%d pos_max=%d tokens=%zu prefix_covers=%d nothing_beyond=%d rm_type=%d -> %s\n",
+                            (int) p0, (int) pos_max_cur, slot.prompt.tokens.size(),
+                            (int) prefix_covers_cache, (int) nothing_beyond, (int) ctx_tgt_seq_rm_type,
+                            nothing_beyond ? "SKIP"
+                                           : (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? "FULL-CLEAR" : "TRIM"));
                     if (nothing_beyond) {
                         SLT_DBG(slot, "skipping memory_seq_rm [%d, end): memory pos_max %d, cached prefix %zu tokens\n", (int) p0, (int) pos_max_cur, slot.prompt.tokens.size());
                     } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
