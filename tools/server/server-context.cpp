@@ -3504,8 +3504,16 @@ private:
                     // Two signals: the memory's last position, and the token list. DeepSeek V4's compressed memory reports
                     // pos_max one past the last token, so an exact-prefix continuation shows pos_max == p0; that is not a
                     // divergence. A real divergence has cached tokens beyond p0 (token list longer than p0).
-                    const bool prefix_covers_cache = (size_t) p0 >= slot.prompt.tokens.size();
-                    const bool nothing_beyond = pos_max_cur < p0 || (prefix_covers_cache && pos_max_cur <= p0);
+                    // [TAG_TRIM_SOUNDNESS] This predicate asks "does the cache hold cells beyond p0?"
+                    // and used to answer it with llama_memory_seq_pos_max. On a hybrid memory that is
+                    //     llama_memory_hybrid::seq_pos_max = std::min(mem_attn->..., mem_recr->...)
+                    // a MINIMUM across two half-caches, so the recurrent half can pull it below p0 while
+                    // the attention half still holds the previous conversation. Skipping then leaves those
+                    // cells for generation to attend to - the one outcome that neither frees them nor fails
+                    // loudly (the TRIM branch aborts on failure, the FULL-CLEAR branch drops the sequence).
+                    // The only question that value answers soundly is "is this sequence empty?".
+                    // Measured 2026-09-20: clean upstream 30/30 vs this tree 12/30 on the same shape.
+                    const bool nothing_beyond = pos_max_cur < 0;
                     if (nothing_beyond) {
                         SLT_DBG(slot, "skipping memory_seq_rm [%d, end): memory pos_max %d, cached prefix %zu tokens\n", (int) p0, (int) pos_max_cur, slot.prompt.tokens.size());
                     } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
