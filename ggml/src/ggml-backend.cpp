@@ -768,6 +768,21 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_SPLIT_INPUTS 30
 #endif
 
+// [TAG_SCHED_SPLIT_INPUTS] The split-input arrays grow on demand, but this value is both their
+// initial capacity and the multiplier for the scratch that ggml_backend_sched_new pre-sizes, so
+// a graph whose splits carry more than this many inputs pays reallocation and re-planning on
+// every build. The glm5next MTP draft graph on an 8-way layer split is the case in point
+// (turbo-tan/llama.cpp-tq3#82 raises it to 128). Env-overridable so the two values can be
+// measured against each other from one binary; unset keeps the upstream default exactly.
+static int ggml_sched_split_inputs_cap(void) {
+    static const int cap = []() {
+        const char * env = getenv("GGML_SCHED_MAX_SPLIT_INPUTS");
+        const int    v   = env ? atoi(env) : 0;
+        return v > 0 ? v : GGML_SCHED_MAX_SPLIT_INPUTS;
+    }();
+    return cap;
+}
+
 #ifndef GGML_SCHED_MAX_COPIES
 #define GGML_SCHED_MAX_COPIES 4
 #endif
@@ -845,10 +860,24 @@ struct ggml_backend_sched {
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
+// [TAG_SCHED_SPLIT_INPUTS] one INFO line the first time either container outgrows the initial
+// capacity: a Release build compiles the DEBUG lines out, so without this there is no way to tell
+// from a server log whether the starting value is ever reached.
+static void ggml_sched_split_inputs_notice(const char * what, int from, int to) {
+    static bool once = false;
+    if (!once) {
+        once = true;
+        GGML_LOG_INFO("ggml_backend_sched: %s outgrew the initial capacity (%d -> %d); "
+                      "initial capacity is %d (set GGML_SCHED_MAX_SPLIT_INPUTS to change)\n",
+                      what, from, to, ggml_sched_split_inputs_cap());
+    }
+}
+
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
-    int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
+    int new_cap = ggml_sched_split_inputs_cap();
     if (split->inputs_capacity > 0) {
         new_cap = 2*split->inputs_capacity;
+        ggml_sched_split_inputs_notice("split inputs", split->inputs_capacity, new_cap);
         GGML_LOG_DEBUG("%s: increasing split inputs capacity from %d to %d\n", __func__, split->inputs_capacity, new_cap);
     }
     auto * pnew = (struct ggml_tensor **) realloc((void *) split->inputs, new_cap * sizeof(struct ggml_tensor *));
@@ -861,9 +890,10 @@ static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split
 }
 
 static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
-    int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
+    int new_cap = ggml_sched_split_inputs_cap();
     if (sched->graph_inputs_capacity > 0) {
         new_cap = 2*sched->graph_inputs_capacity;
+        ggml_sched_split_inputs_notice("graph inputs", sched->graph_inputs_capacity, new_cap);
         GGML_LOG_DEBUG("%s: increasing graph inputs capacity from %d to %d\n", __func__, sched->graph_inputs_capacity, new_cap);
     }
     auto * pnew = (struct ggml_tensor **) realloc((void *) sched->graph_inputs, new_cap * sizeof(struct ggml_tensor *));
@@ -1875,7 +1905,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
-    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    const size_t nodes_size = graph_size + ggml_sched_max_splits*ggml_sched_split_inputs_cap()*2;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
@@ -1884,14 +1914,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+    sched->context_buffer_size = ggml_sched_max_splits*ggml_sched_split_inputs_cap()*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
-    sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
+    sched->graph_inputs_capacity = ggml_sched_split_inputs_cap();
     sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
 
     for (int b = 0; b < n_backends; b++) {
