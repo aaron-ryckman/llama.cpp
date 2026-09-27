@@ -22,6 +22,21 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <chrono>
+
+// GGML_SCHED_TRACE=1: host-side timing of every blocking point in the scheduler (diagnostic only)
+static int ggml_sched_trace_level(void) {
+    static int lvl = -1;
+    if (lvl < 0) {
+        const char * e = getenv("GGML_SCHED_TRACE");
+        lvl = e ? atoi(e) : 0;
+    }
+    return lvl;
+}
+static int64_t ggml_sched_trace_us(void) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1637,11 +1652,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        const int64_t tr_t0 = ggml_sched_trace_level() ? ggml_sched_trace_us() : 0;
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        const int64_t tr_t1 = ggml_sched_trace_level() ? ggml_sched_trace_us() : 0;
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (ggml_sched_trace_level()) {
+            GGML_LOG_WARN("SCHEDTRACE realloc ids_changed=%d nodes=%d leafs=%d drain_us=%lld reserve_us=%lld\n",
+                (int) backend_ids_changed, sched->graph.n_nodes, sched->graph.n_leafs,
+                (long long) (tr_t1 - tr_t0), (long long) (ggml_sched_trace_us() - tr_t1));
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1661,10 +1683,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    const bool tr_on = ggml_sched_trace_level() > 0;
+    std::string tr_line;
+    const int64_t tr_start = tr_on ? ggml_sched_trace_us() : 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t tr_s0 = tr_on ? ggml_sched_trace_us() : 0;
+        int tr_ninp_graph = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1675,6 +1703,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
+        const int64_t tr_s1 = tr_on ? ggml_sched_trace_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1683,6 +1712,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                tr_ninp_graph++;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1799,10 +1829,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t tr_s2 = tr_on ? ggml_sched_trace_us() : 0;
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (tr_on) {
+                const int64_t tr_s3 = ggml_sched_trace_us();
+                char buf[320];
+                const char * first = split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "-";
+                const char * last  = split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1]->name : "-";
+                snprintf(buf, sizeof(buf), " [%d:%s n=%d in=%d/g%d pre=%lld in=%lld comp=%lld %.24s..%.24s]", split_id,
+                    ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs, tr_ninp_graph,
+                    (long long) (tr_s1 - tr_s0), (long long) (tr_s2 - tr_s1), (long long) (tr_s3 - tr_s2), first, last);
+                tr_line += buf;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1844,6 +1885,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (tr_on) {
+        GGML_LOG_WARN("SCHEDTRACE compute copy=%d n_copies=%d splits=%d host_us=%lld%s\n", sched->cur_copy, sched->n_copies,
+            sched->n_splits, (long long) (ggml_sched_trace_us() - tr_start), tr_line.c_str());
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2035,8 +2081,12 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const int64_t tr_t0 = ggml_sched_trace_level() ? ggml_sched_trace_us() : 0;
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (ggml_sched_trace_level()) {
+        GGML_LOG_WARN("SCHEDTRACE sched_synchronize us=%lld is_alloc=%d\n", (long long) (ggml_sched_trace_us() - tr_t0), (int) sched->is_alloc);
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

@@ -1364,11 +1364,14 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool llama_trace = getenv("GGML_SCHED_TRACE") && atoi(getenv("GGML_SCHED_TRACE")) > 0;
+    const int64_t tr_p0 = llama_trace ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    const int64_t tr_p1 = llama_trace ? ggml_time_us() : 0;
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1413,6 +1416,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t tr_p2 = llama_trace ? ggml_time_us() : 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1422,8 +1426,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    const int64_t tr_p3 = llama_trace ? ggml_time_us() : 0;
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (llama_trace) {
+        LLAMA_LOG_WARN("LLAMATRACE process apply_us=%lld build_alloc_us=%lld set_inputs_us=%lld compute_us=%lld splits=%d\n",
+            (long long) (tr_p1 - tr_p0), (long long) (tr_p2 - tr_p1), (long long) (tr_p3 - tr_p2), (long long) (ggml_time_us() - tr_p3),
+            ggml_backend_sched_get_n_splits(sched.get()));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1858,7 +1868,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        static const bool llama_trace = getenv("GGML_SCHED_TRACE") && atoi(getenv("GGML_SCHED_TRACE")) > 0;
+        const int64_t tr_u0 = llama_trace ? ggml_time_us() : 0;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (llama_trace) {
+            LLAMA_LOG_WARN("LLAMATRACE ubatch n_tokens=%u n_outputs=%d process_us=%lld reused_total=%d pp=%d\n", ubatch.n_tokens, n_outputs,
+                (long long) (ggml_time_us() - tr_u0), n_reused, (int) cparams.pipeline_parallel);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
