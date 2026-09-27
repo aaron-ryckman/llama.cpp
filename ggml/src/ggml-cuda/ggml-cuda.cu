@@ -79,6 +79,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
@@ -494,7 +495,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        static const bool pool_trace = getenv("GGML_SCHED_TRACE") != nullptr && atoi(getenv("GGML_SCHED_TRACE")) > 0;
+        const auto pool_t0 = std::chrono::steady_clock::now();
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        if (pool_trace) {
+            GGML_LOG_WARN("CUDATRACE pool_malloc dev=%d size=%zu pool=%zu us=%lld\n", device, look_ahead_size, pool_size,
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pool_t0).count());
+        }
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
