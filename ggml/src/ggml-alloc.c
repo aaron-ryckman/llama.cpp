@@ -1006,7 +1006,53 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+static int ggml_gallocr_trace_level(void) {
+    static int lvl = -1;
+    if (lvl < 0) {
+        const char * e = getenv("GGML_SCHED_TRACE");
+        lvl = e ? atoi(e) : 0;
+    }
+    return lvl;
+}
+
+static bool ggml_gallocr_needs_realloc_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+
+// GGML_SCHED_TRACE=1: log the first reason a graph does not fit the current allocation plan (diagnostic only)
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    const bool res = ggml_gallocr_needs_realloc_impl(galloc, graph);
+    if (res && ggml_gallocr_trace_level() > 0) {
+        if (galloc->n_nodes != graph->n_nodes || galloc->n_leafs != graph->n_leafs) {
+            GGML_LOG_WARN("ALLOCTRACE realloc: topology nodes %d -> %d, leafs %d -> %d\n",
+                galloc->n_nodes, graph->n_nodes, galloc->n_leafs, graph->n_leafs);
+        } else {
+            for (int i = 0; i < graph->n_nodes; i++) {
+                struct ggml_tensor * node = graph->nodes[i];
+                struct node_alloc * na = &galloc->node_allocs[i];
+                if (!ggml_gallocr_node_needs_realloc(galloc, node, &na->dst)) {
+                    GGML_LOG_WARN("ALLOCTRACE realloc: node %d %s (%s) outgrew its slot (size_max=%zu)\n",
+                        i, node->name, ggml_op_desc(node), na->dst.size_max);
+                    break;
+                }
+                bool found = false;
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src != NULL && !ggml_gallocr_node_needs_realloc(galloc, src, &na->src[j])) {
+                        GGML_LOG_WARN("ALLOCTRACE realloc: src %d %s of node %d %s outgrew its slot (size_max=%zu)\n",
+                            j, src->name, i, node->name, na->src[j].size_max);
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    break;
+                }
+            }
+        }
+    }
+    return res;
+}
+
+static bool ggml_gallocr_needs_realloc_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
