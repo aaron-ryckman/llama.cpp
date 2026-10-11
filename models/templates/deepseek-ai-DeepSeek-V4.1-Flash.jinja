@@ -82,7 +82,9 @@
 {%- if reasoning_effort is defined and reasoning_effort is string -%}
   {%- if reasoning_effort == 'low' or reasoning_effort == 'minimal' -%}
     {%- set effort.value = 50 -%}
-  {%- elif reasoning_effort == 'high' or reasoning_effort == 'medium' or reasoning_effort == 'default' -%}
+  {%- elif reasoning_effort == 'medium' -%}
+    {%- set effort.value = 62 -%}
+  {%- elif reasoning_effort == 'high' or reasoning_effort == 'default' -%}
     {%- set effort.value = 75 -%}
   {%- elif reasoning_effort == 'max' or reasoning_effort == 'xhigh' -%}
     {%- set effort.value = 100 -%}
