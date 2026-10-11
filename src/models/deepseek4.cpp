@@ -428,6 +428,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
 
     // V4 collapses with the mix this sublayer just computed.
     // V4.1 hands its coefficients to the NEXT sublayer instead - attention uses the previous block's ffn mix, the FFN uses this block's attention mix - so the caller passes the carried one.
+    // A caller that replaces the collapse with its own selection (V4.1 layer 0, which has no carried mix yet) must not get a mix built here.
+    // A built but unused mix registers a fused node that no backend is ever assigned.
+    // The fusion probe then reads that as missing support and disables the fused hc_pre for every layer.
+    if (!collapse) {
+        return nullptr;
+    }
     ggml_tensor * result = build_hc_pre(x, mix_in ? mix_in : pre, il);
     return result;
 }
@@ -805,11 +811,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
         ggml_tensor * sinks,
         float kq_scale,
         int il,
-        int il_kv,
         bool idx_tier,
         ggml_tensor * top_k) const {
-    // il_kv is the layer that owns the compressed rows.
-    // For V4 that is this layer; V4.1 has the layers after a source read the source's cache, which is the only place they differ.
+    // V4.1 layers after a source reuse the source's compressed cache, which the cache resolves from il (a replica on
+    // this layer's device under -sm layer). top_k, when given, is the V4.1 sparse selection over those rows.
     const auto & inp_hca = idx_tier ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
     GGML_ASSERT(inp_hca.kq_mask);
 
@@ -836,7 +841,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "hca_raw_k", il);
 
-    ggml_tensor * hca_k = (idx_tier ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca())->get_k(ctx0, il_kv);
+    ggml_tensor * hca_k = build_get_k(idx_tier ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca(), il);
     const int64_t n_hca = inp_hca.kq_mask->ne[0];
     GGML_ASSERT(n_hca > 0);
     GGML_ASSERT(n_hca <= hca_k->ne[2]);
@@ -1529,8 +1534,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         const char * e = getenv("LLAMA_DSV41_QNORM");
         return !(e != nullptr && atoi(e) != 0);
     }();
-    const bool v41_attn = hparams.dsv41_n_kv_source > 0 || hparams.dsv41_dspark;
-    if (!(v41_attn && q_norm_off)) {
+    // V4.1 has no per-head query norm, and neither does its DSpark draft: our loader flags the draft (dsv41_dspark,
+    // from the absent output_hc_* head) and mx detects it from the markov weights; either test skips the norm
+    const bool v41_attn   = hparams.dsv41_n_kv_source > 0 || hparams.dsv41_dspark;
+    const bool dspark_v41 = inp_mtp && model.arch == LLM_ARCH_DFLASH && model.dspark_markov_w1 && model.hc_head_fn == nullptr;
+    if (!(v41_attn && q_norm_off) && !dspark_v41) {
         q = ggml_rms_norm(ctx0, q, norm_rms_eps);
     }
     cb(q, "q_norm", il);
@@ -1588,8 +1596,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     // the pooled compressor serves V4's plain tier, and both of V4.1's
     const bool pooled   = (v41 ? owns_kv : tier_plain) && !(v41 && compress_off);
+    const llm_graph_input_dsv4::comp_input no_tier = {};
     const auto & tier   = inp_dsv4 ? (v41 && tier_idx ? inp_dsv4->get_csa() : inp_dsv4->get_hca())
-                                   : inp_dsv4->get_hca();
+                                   : no_tier;
     const int64_t tier_ratio = ratio;
 
     // Sparse compute (gather) or mask. The gather runs on small ubatches only: it materializes n_top_k rows per token
@@ -1813,8 +1822,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         }
 
         const auto * tier_kv = (v41 && tier_idx) ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca();
-        ggml_build_forward_expand(gf, tier_kv->cpy_k(ctx0,
-                    kv_comp_hca, tier.state_write_idxs, il));
+        build_cpy_k(tier_kv, kv_comp_hca, tier.state_write_idxs, il);
     }
 
     if (pooled && tier.state_pos) {
@@ -1902,7 +1910,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     } else if (ratio != 0 && tier.kq_mask && !(v41 && compress_off)) {
         // the compressed rows live on the source layer, which for V4 is this layer itself
         out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), il, kv_src, v41 && tier_idx, top_k);
+                1.0f/sqrtf(float(n_embd_head)), il, v41 && tier_idx, top_k);
     } else {
         out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), il);

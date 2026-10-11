@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 // Copy a bounded table out of the model file, refusing anything that would not fit.
@@ -209,6 +211,9 @@ public:
     }
 
     ggml_tensor * rows = nullptr;   // I32 [n_hash_cols*n_tokens, n_engram_layers]
+    int n_threads = 0;
+    std::vector<ggml_tensor *> emb;
+    std::vector<float> gathered;
 
     const llama_model_deepseek4 & pmodel;
 
@@ -278,6 +283,32 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    for (size_t e = 0; e < emb.size(); ++e) {
+        const ggml_tensor * table = pmodel.layers[hp.engram_layer_ids[e]].engram_embed;
+        const int64_t per_table = n_cols*n_tokens;
+        gathered.resize(static_cast<size_t>(per_table*table->ne[0]));
+        const auto to_float = ggml_get_type_traits(table->type)->to_float;
+        GGML_ASSERT(to_float && ggml_nelements(emb[e]) == static_cast<int64_t>(gathered.size()));
+        const auto * base = static_cast<const uint8_t *>(table->data);
+        const int nt = std::max(1, std::min(n_threads, static_cast<int>((per_table + 63)/64)));
+        auto work = [&](int t) {
+            for (int64_t k = per_table*t/nt; k < per_table*(t + 1)/nt; ++k) {
+                const int32_t row = idx[e*per_table + k];
+                GGML_ASSERT(row >= 0 && row < table->ne[1]);
+                to_float(base + row*table->nb[1], gathered.data() + k*table->ne[0], table->ne[0]);
+            }
+        };
+        std::vector<std::thread> workers;
+        try {
+            for (int t = 1; t < nt; ++t) { workers.emplace_back(work, t); }
+            work(0);
+        } catch (...) {
+            for (auto & worker : workers) { worker.join(); }
+            throw;
+        }
+        for (auto & worker : workers) { worker.join(); }
+        ggml_backend_tensor_set(emb[e], gathered.data(), 0, gathered.size()*sizeof(float));
+    }
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -293,6 +324,38 @@ ggml_tensor * llama_model_deepseek4::graph::build_inp_engram(const llama_model &
     // one contiguous run of row indices per table, so each table gather is a plain 1d view
     inp->rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_cols*n_tokens, n_eng);
     ggml_set_input(inp->rows);
+
+    static const int n_threads = [] {
+        const char * env = getenv("LLAMA_DSV41_HOST_INPUT_THREADS");
+        if (!env) { return 0; }
+        char * end = nullptr;
+        const long count = std::strtol(env, &end, 10);
+        if (end == env || *end || count < 0 || count > 64) {
+            throw std::runtime_error("LLAMA_DSV41_HOST_INPUT_THREADS requires 0..64");
+        }
+        if (count) {
+            LLAMA_LOG_WARN("deepseek41: experimental host Engram inputs, threads=%ld, workers joined before upload\n", count);
+        }
+        return static_cast<int>(count);
+    }();
+    engram_host_emb.clear();
+    if (n_threads > 0) {
+        if (model.split_mode() != LLAMA_SPLIT_MODE_LAYER && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+            throw std::runtime_error("Experimental host Engram inputs require layer or tensor split");
+        }
+        inp->n_threads = n_threads;
+        for (int64_t e = 0; e < n_eng; ++e) {
+            const ggml_tensor * table = model.layers[hparams.engram_layer_ids[e]].engram_embed;
+            if (!table || (!hparams.no_alloc && !table->data) || !table->buffer || !ggml_backend_buffer_is_host(table->buffer) ||
+                    table->type != GGML_TYPE_MXFP4 || table->ne[0] != hparams.engram_head_dim || !ggml_is_contiguous(table)) {
+                throw std::runtime_error("Experimental host Engram inputs require canonical host MXFP4 tables");
+            }
+            auto * tensor = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.engram_head_dim*n_cols, n_tokens);
+            ggml_set_input(tensor);
+            engram_host_emb.push_back(tensor);
+            inp->emb.push_back(tensor);
+        }
+    }
 
     ggml_tensor * rows = inp->rows;
     res->add_input(std::move(inp));
@@ -316,10 +379,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_engram(
     const int64_t hc       = hparams.dsv4_hc_mult;
     const int64_t nt       = x->ne[2];
 
-    ggml_tensor * rows = ggml_view_1d(ctx0, idx, n_cols*nt, e*idx->nb[1]);
-
-    ggml_tensor * emb = ggml_get_rows(ctx0, layer.engram_embed, rows);
-    emb = ggml_reshape_2d(ctx0, emb, head_dim*n_cols, nt);
+    ggml_tensor * emb = nullptr;
+    if (static_cast<size_t>(e) < engram_host_emb.size()) {
+        emb = engram_host_emb[e];
+    } else {
+        ggml_tensor * rows = ggml_view_1d(ctx0, idx, n_cols*nt, e*idx->nb[1]);
+        emb = ggml_get_rows(ctx0, layer.engram_embed, rows);
+        emb = ggml_reshape_2d(ctx0, emb, head_dim*n_cols, nt);
+    }
     cb(emb, "engram_embd", il);
 
     // one key per hc copy, then a single value shared by all of them

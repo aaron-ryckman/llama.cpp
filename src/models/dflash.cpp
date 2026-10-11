@@ -186,6 +186,10 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, head_hc_flags);
         hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, head_hc_flags);
         hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, head_hc_flags);
+        if ((hc_head_fn != nullptr) != (hc_head_base != nullptr) ||
+                (hc_head_fn != nullptr) != (hc_head_scale != nullptr)) {
+            throw std::runtime_error("DSpark output HC tensors must be all present or all absent");
+        }
 
         for (int i = 0; i < n_layer; ++i) {
             auto & layer = layers[i];

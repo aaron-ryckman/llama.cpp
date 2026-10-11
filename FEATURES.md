@@ -29,7 +29,6 @@ cmake --build build --config Release -j
 Recommended environment (each variable enables one of the features above):
 
 ```bash
-export GGML_ENABLE_CUSTOM_AR=1      # custom multi-GPU AllReduce
 export HSA_FORCE_FINE_GRAIN_PCIE=1  # peer-write AllReduce fast path (AMD over PCIe, validated gfx906)
 export GPU_MAX_HW_QUEUES=8          # MoE throughput on -tps
 export LLAMA_ENABLE_MTP_OPT=1       # MTP optimizations (with --spec-type draft-mtp)
@@ -73,13 +72,24 @@ requires `n_gpus % T == 0`. Backend-generic.
 An optional peer-write broadcast plus two-shot reduce-scatter / allgather
 AllReduce for the tensor-parallel reduction (in addition to upstream's
 `allreduce.cu`). F32 on the wire and faster than the RCCL / NCCL ring for token
-generation over PCIe. Enable with `GGML_ENABLE_CUSTOM_AR=1`; the fast peer-write
+generation over PCIe. On by default, `GGML_ENABLE_CUSTOM_AR=0` turns it off; the fast peer-write
 path needs fine-grain PCIe coherence (`HSA_FORCE_FINE_GRAIN_PCIE=1` on any AMD
 over PCIe, a no-op on hardware-coherent GPUs and ignored on NVIDIA). Decode-size
 collectives automatically use two-shot for TP5, TP8, TP10, and TP4 pipeline
-stages; standalone TP4 stays on broadcast. Large prompt collectives keep the
-RCCL / NCCL size gate. `GGML_TP_AR_TWOSHOT=0` forces broadcast and `=1` forces
-two-shot for diagnostics. Validated on gfx906.
+stages. A standalone TP4 group crosses to two-shot at 8192 elements, which keeps the
+one-token message of ordinary decode on broadcast and moves the wider message a
+speculative verify batch sends, where broadcast's per-peer write is 74% of the call.
+Large prompt collectives keep the RCCL / NCCL size gate, so prefill is unaffected.
+Qwen on four MI50, 15k prompt, 512 generated, identical output and draft acceptance:
+
+```
+Qwen3.8-27B-Q8 + DFlash2 drafter   -tps 4   43.9 -> 48.0 t/s decode
+Qwen3.6-27B-Q8 + MTP head          -tps 4   66.7 -> 72.2 t/s decode
+Qwen3.8-27B-Q8 no drafter          -tps 4   47.4 -> 47.2 t/s decode  (guardrail)
+```
+
+`GGML_TP_AR_TWOSHOT=0` forces broadcast and `=1` forces two-shot for diagnostics,
+and `GGML_TP_AR_TWOSHOT_MIN_NE` sets the crossover in elements. Validated on gfx906.
 
 ## MTP speculative-decode optimizations
 
@@ -128,7 +138,22 @@ the host submission spread at each. Each GPU now records its whole token (subgra
 so on) into a single CUDA or HIP graph and replays that once per token, which is
 bit-exact. Worth +6% token generation on a 4-GPU tensor split, on both a MoE and
 a dense model. On 8 GPUs the throughput gain is small but run-to-run spread
-drops from 11% to 2.5%. Prefill is unchanged by design. On by default;
+drops from 11% to 2.5%. Prefill is unchanged by design.
+
+A pipeline records one graph per stage and replays the stage transfer between them,
+so a multi-stage split is captured as well, which it was not before:
+
+```
+DeepSeek-V4.1-Flash MXFP4  -tps 2, 10 GPUs, 5 stages   23.0 -> 23.9 t/s decode
+gpt-oss-120b MXFP4         -tps 2,  8 GPUs, 4 stages   82.2 -> 89.3 t/s decode
+Qwen3.8-27B-Q8             -tps 2,  4 GPUs, 2 stages   29.6 -> 31.3 t/s decode
+```
+
+While the token graph owns the token, each lane's own per-subgraph graph cache is
+switched off, because it records the same kernels underneath and reuses each capture
+about twice before the next graph displaces it. That is worth 43.5 -> 47.1 t/s decode
+on a dense 27B at four lanes and nothing on a 30-layer MoE, so the gain is model
+dependent while the cost never is. On by default;
 `GGML_META_TOKEN_GRAPH=0` restores the per-subgraph dispatch. Requires the
 concurrent lane dispatch above. Validated on gfx906.
 
@@ -177,8 +202,7 @@ A 16965-token prompt takes about 678 thousand major faults and 63 GB of reads on
 
 Three diagnostic env gates ship with the support, all default off and each logging once when engaged: `LLAMA_DSV41_NO_ENGRAM` drops the Engram contribution, `LLAMA_DSV41_NO_COMPRESS` drops the compressed tier, and `LLAMA_DSV41_QNORM` restores the V4 query norm.
 
-Scope: `-sm layer` only.
-`-sm tensor` loads and runs but does not reproduce its own output, so it carries no claim here.
+Scope: `-sm layer`, and `-sm tensor -tps 2` since the incremental stage transfer for persistent caches, which reproduces its own output and beats layer mode on decode.
 
 ### DSpark speculative decoding for V4.1
 
@@ -191,7 +215,7 @@ Block size 5, anchor-first, noise token 128799 and the confidence-gated truncati
 The sidecar can be pinned to one GPU with `-devd`: it borrows the target's `output.weight`, which under `-sm layer` sits on the target's last device, so the draft context now adds that device's backend when it is not among the draft's own (without it the scheduler's split pass aborted on the foreign leaf, `GGML_ASSERT(src_backend_id != -1)`); the lm head runs where its weight lives and only the activations and logits cross devices.
 `LLAMA_DSV41_DECODER_SKIP` declines a prompt ubatch that requests a tap past the decoder's source layer (layer 20), so it never engages while a V4.1 DSpark draft is attached; `LLAMA_DSV41_TOPK` is unaffected.
 
-Unverified: this was written against the reference `inference/model.py` and the sidecar's GGUF metadata and built CPU-only; it has not yet run against the real model, so no acceptance or throughput figure is claimed here.
+This is the aaron-ryckman fork's implementation (kept over mx's, which detects the same sidecar from its markov weights); it ran against the real model on 8x MI50 (dreadnaught ops doc `2026-09-12-deepseek-v41.md`, "DSpark tuning").
 
 ## Qwen3.8-Flash-Next tensor parallelism
 
@@ -270,6 +294,26 @@ on the same topology this raised draft acceptance from 63.8% to 83.5% and
 generation from 26.8 to 31.5 t/s without changing prefill throughput.
 `LLAMA_DSPARK_TARGET_REPACK=1` restores target repacking. Validated on gfx906.
 
+## DFlash drafters under tensor parallelism
+
+A DFlash or DFlash2 drafter without its own output tensor reads the target's lm head,
+which `-sm tensor` splits across the group, so the drafter's selector runs top-k over
+logits that each lane holds only a slice of. The meta backend now gathers a source that
+is split along axis 0 before an op that reads whole rows, for every such op (top-k,
+argsort, sum-rows, cumsum, mean, argmax, the norms and the cross-entropy pair), stages
+each lane's slice into one tensor and repoints the consumers at it, so the drafter sees
+the whole vocabulary. Without it, the drafter aborted at partition time instead of
+serving. Qwen3.8-27B-Q8 with its DFlash2 drafter on two MI50, `--spec-draft-n-max 5`,
+against the same model under `-sm layer`:
+
+```
+620-token prompt, 128 generated     320 -> 457 t/s prefill   43.8 -> 52.1 t/s decode   100 of 128 accepted in both
+16k summary, 512 generated          485 -> 544 t/s prefill   29.5 -> 39.4 t/s decode   349/810 vs 351/797 accepted
+```
+
+A graph that plans no gather is untouched, which a plain Qwen and DeepSeek-V4.1 confirm
+bit-for-bit. `-tpsd` runs the drafter on fewer lanes than the target. Validated on gfx906.
+
 ## Allocation layout cache
 
 A change in the scheduler's backend assignment forced a drain-and-reserve before
@@ -307,6 +351,55 @@ byte-identical in every arm:
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point
 stage-transfer path (`GGML_META_XFER_RCCL`) for the multi-stage pipeline.
+
+## Incremental stage transfer for persistent caches
+
+A multi-stage `-sm tensor` pipeline hands every mirrored tensor a later stage reads across the stage boundary.
+When the reader is a view of a persistent cache, the boundary tensor used to be the writer's set_rows output, which is the whole cache view, so each hop copied the full cache on every token, and each reading layer's own view of a shared cache added one more full copy.
+DeepSeek-V4.1 layers after a source layer read the source layer's caches, and on ten MI50 at `-tps 2` the stage 3 hop moved about 244 MB per token, which is where tensor decode lost to layer mode and why the prefill pipeline never filled.
+The meta backend now keeps a host copy of the small integer inputs it is handed (the KV cell indices) and transfers a set_rows boundary as the dense cell range those indices name, a row block of each lane's own cache, exact bytes.
+A pure view of a persistent cache is served by the cache's writer once instead of one full copy per reading layer.
+Sparse or unknown indices fall back to the full copy, and `GGML_META_XFER_ROWS=0` restores the previous transfers.
+Measured on ten MI50 with a 16965-token prompt at temperature 0, Engram off, `-sm tensor -tps 2`, with the greedy top-5 records bit-identical across three requests and two boots:
+
+```
+prefill  214 -> 601 t/s     decode  7.2 -> 21.5 t/s     (-sm layer on the same prompt: 600 to 650 and 14.1)
+```
+
+Only multi-stage tensor splits go through this path, layer mode and single-stage splits do not run it, and a model whose layers read only their own caches moves nothing new.
+
+## Stage-local mirrored weights
+
+A multi-stage `-sm tensor` split used to place a full copy of every mirrored weight (norms, routers, unsplit projections) on every card, including cards of stages that never read it.
+llama now names the lanes that read a mirrored layer weight, which are the lanes of its own stage plus the neighbouring stage for the first and last layer of a stage, because the stage seam falls between the last AllReduce of one layer and the first split weight of the next.
+The meta backend allocates, writes and reads the copy only on those lanes, deciding presence through the view root.
+A node with no owning stage of its own follows the weight instead of the walk, taking the lowest stage whose lanes hold every stage-local mirrored weight it reads, so a draft context narrower than its target serves rather than aborting at load.
+A partition-time check still aborts when two weights a node needs sit on different stages, which no placement can satisfy.
+Compute placement does not change, and `LLAMA_STAGE_LOCAL_MIRROR=0` restores a copy on every lane.
+Largest card VRAM, on ten MI50 unless noted, greedy outputs with top-5 records bit-identical with the copies on and off, prefill and decode unchanged:
+
+```
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack on   out of memory at load -> serves with 1.2 GiB free per card
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack off  31374 -> 30496 MiB
+DeepSeek-V4-Flash MXFP4     -tps 2                            18876 -> 17936 MiB
+DeepSeek-V4-Flash MXFP4     -tps 4, 8 GPUs                    21780 -> 21178 MiB
+Qwen3.8-Flash-Next Q8_0     -tps 2                            17230 -> 16504 MiB
+MiniMax-M2.1 Q8_0           -tps 2                            26501 -> 26357 MiB
+gpt-oss-120b MXFP4          -tps 2, 4 GPUs                    16297 -> 16273 MiB  (guardrail)
+```
+
+The saving is the mirrored mass, so models whose large matrices are all split (gpt-oss, Gemma 4, dense Qwen) change by a few MiB, and layer mode and single-stage splits are untouched.
+
+## Tied output heads under tensor parallelism
+
+A model whose output head is tied to its token embedding (the gemma-4 family among
+others) loads the head as a duplicate of `token_embd.weight` and the duplicate keeps
+that name. The tensor split rules go by name, so the head used to fall to the mirrored
+default together with the embedding table. Every lane then ran the whole head each
+token. The duplicate is only ever read by a matrix multiply, so it now takes the same
+vocabulary split as an untied `output.weight`. gemma-4-26B-A4B-Q8 on four MI50 at
+`-tps 4`: generation 104 to 117 t/s, prefill unchanged, 561 MiB less per card, output
+identical. Layer and single-device runs never mirrored the head and are unchanged.
 
 ## gfx906 kernel tuning
 

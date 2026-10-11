@@ -1508,6 +1508,9 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    // set once by an owner that captures and replays whole tokens itself
+    bool graphs_owner_disabled = false;
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
@@ -1583,6 +1586,7 @@ struct ggml_backend_cuda_context {
     size_t q8_1_cache_misses = 0;
     size_t q8_1_cache_peak   = 0; // most entries alive at once, over the run
     bool q8_1_cache_pressure_logged = false;
+    bool cublas_chunk_logged = false;
     void q8_1_cache_reset() {
         q8_1_cache.clear();
     }

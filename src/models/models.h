@@ -1210,6 +1210,7 @@ struct llama_model_deepseek4 : public llama_model_base {
         // V4.1 ships none and reuses the mix the last layer already computed.
         // This runs from the base constructor, where a virtual call cannot reach a derived override, so the fold keys off whether the head tensors are present.
         mutable ggml_tensor * last_ffn_pre = nullptr;
+        mutable std::vector<ggml_tensor *> engram_host_emb;
 
         ggml_tensor * build_head_fold(const llama_model & model, ggml_tensor * x) const;
 
@@ -1302,7 +1303,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 int il) const;
 
-        // il_kv names the layer whose compressed rows are read, which V4.1 needs because its layers reuse the cache of the source layer before them. idx_tier picks between the two compressed tiers.
+        // V4.1 layers after a source reuse the source's compressed cache, which the cache resolves from il. idx_tier picks between the two compressed tiers.
         // top_k, when given, is I32 [n_top_k, n_tokens/n_stream, 1, n_stream] of compressed rows to keep; every other compressed row is masked out (V4.1 sparse selection).
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,
@@ -1312,7 +1313,6 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * sinks,
                 float kq_scale,
                 int il,
-                int il_kv,
                 bool idx_tier,
                 ggml_tensor * top_k = nullptr) const;
 

@@ -992,6 +992,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_repack_try_release_scratch(buft_ctx->device)) {
+        // The repack upload scratch outlives the load until the first compute, so a compute reserve can find it still resident.
+        (void)cudaGetLastError();
+        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+        if (err == cudaSuccess) {
+            GGML_LOG_DEBUG("%s: allocation of %.2f MiB on device %d fit after releasing the repack upload scratch\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+        }
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -1096,7 +1104,8 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
 
     // Custom PCIe-friendly AllReduce (GPU-barrier kernel, no NCCL proxy threads).
-    // Opt-in via GGML_ENABLE_CUSTOM_AR=1. Off by default; NCCL is the default path.
+    // On by default and GGML_ENABLE_CUSTOM_AR=0 turns it off.
+    // Without a peer-write coherent fabric it stays on the NCCL path by itself.
     ggml_cuda_tp::CustomARContext custom_ar;
     bool use_custom_ar = false;
 
@@ -1595,9 +1604,9 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     }
 
     // Custom AR can coexist with NCCL/internal. The top-level dispatch tries it
-    // first for eligible F32 tensors when GGML_ENABLE_CUSTOM_AR=1 is set.
+    // first for eligible F32 tensors unless GGML_ENABLE_CUSTOM_AR=0 is set.
     const char * env_custom_ar = getenv("GGML_ENABLE_CUSTOM_AR");
-    const bool enabled_via_env = env_custom_ar && env_custom_ar[0] != '\0' && env_custom_ar[0] != '0';
+    const bool enabled_via_env = env_custom_ar == nullptr || env_custom_ar[0] == '\0' || env_custom_ar[0] != '0';
     const bool supported_nranks = (n_backends >= 2 && n_backends <= ggml_cuda_tp::kMaxRanks);
     if (enabled_via_env && supported_nranks) {
         ggml_cuda_tp::tp_custom_ar_init(&ret->custom_ar, (int)n_backends, ret->dev_ids.data());
@@ -2083,8 +2092,22 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
+    // A large 2D weight (a BF16 output head is 2.5 GiB as F32) is converted and multiplied in row blocks, so the workspace stays bounded.
+    // Each output row is the product of one weight row, so the blocks give the same rows as one call.
+    static const size_t chunk_budget = [] {
+        const char * e = getenv("GGML_CUDA_CUBLAS_CHUNK_MIB");
+        const size_t mib = e ? size_t(std::max(0, atoi(e))) : 256;
+        return mib ? mib << 20 : SIZE_MAX; // 0 keeps the whole weight in one conversion
+    }();
+    const bool    chunk_src0   = compute_type == GGML_TYPE_F32 && src0->type != compute_type && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                                 ggml_is_contiguously_allocated(src0) && ggml_nelements(src0)*sizeof(cuda_t) > chunk_budget;
+    const int64_t chunk_rows   = chunk_src0 ? std::max<int64_t>(1, chunk_budget/(ne00*sizeof(cuda_t))) : ne01;
+
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
+    } else if (chunk_src0) {
+        alloc_with_cache_recovery(src0_alloc, std::min(chunk_rows, ne01)*ne00, "source-0 conversion");
+        s01 = ne00;
     } else {
         alloc_with_cache_recovery(src0_alloc, ggml_nelements(src0), "source-0 conversion");
 
@@ -2180,7 +2203,25 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    if (chunk_src0) {
+        const auto convert_func = traits::convert(src0->type);
+        GGML_ASSERT(convert_func != nullptr);
+        if (!ctx.cublas_chunk_logged) {
+            GGML_LOG_DEBUG("CUDA cuBLAS[%d]: converting %s in blocks of %" PRId64 " rows (%" PRId64 " rows of %" PRId64 " elements)\n",
+                           ctx.device, ggml_type_name(src0->type), chunk_rows, ne01, ne00);
+            ctx.cublas_chunk_logged = true;
+        }
+        for (int64_t r0 = 0; r0 < ne01; r0 += chunk_rows) {
+            const int64_t nr = std::min(chunk_rows, ne01 - r0);
+            convert_func((const char *) src0->data + r0*nb01, src0_alloc.get(), nr*ne00, main_stream);
+            CUBLAS_CHECK(
+                cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nr, ne11, ne10,
+                        (const float *) alpha, (const float *) src0_alloc.get(), s01,
+                                               (const float *) src1_ptr, s11,
+                        (const float *) beta,  (float       *) dst_ptr + r0, ne0));
+        }
+    } else if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
@@ -4285,6 +4326,36 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // The bias of the gate arrives through a VIEW node that the graph builder places between the MUL and the ADD.
+    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_VIEW && ops.begin()[2] == GGML_OP_ADD &&
+            ops.begin()[3] == GGML_OP_UNARY && ops.begin()[4] == GGML_OP_SCALE &&
+            unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID) {
+        if (node_idx + 4 >= cgraph->n_nodes) {
+            return false;
+        }
+        // The VIEW of the bias weight is left out of the fused set: it computes nothing and its source is a weight the
+        // lane buffers do not flag as constant, which would fail the subgraph check for no reason.
+        const int          gate_idxs[4] = { node_idx, node_idx + 2, node_idx + 3, node_idx + 4 };
+        const enum ggml_op gate_ops[4]  = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+        const int          gate_out[1]  = { node_idx + 4 };
+        const bool sub_ok = ggml_can_fuse_subgraph_ext(cgraph, gate_idxs, 4, gate_ops, gate_out, 1);
+        if (!sub_ok) {
+            return false;
+        }
+        if (ggml_get_unary_op(cgraph->nodes[node_idx+3]) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+        if (cgraph->nodes[node_idx+2]->src[1] != cgraph->nodes[node_idx+1]) {
+            return false;
+        }
+        if (!ggml_cuda_should_fuse_mul_add_sigmoid_scale(cgraph->nodes[node_idx], cgraph->nodes[node_idx+2],
+                                                         cgraph->nodes[node_idx+3], cgraph->nodes[node_idx+4])) {
+            return false;
+        }
+        int out_nodes[] = { node_idx + 4 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4443,6 +4514,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         return true;
     }
+
 
     return false;
 }
@@ -5267,6 +5339,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // The DeepSeek-V4 hyper-connection gates: sigmoid(x * s + b) * scale + bias, four elementwise launches per gate, four gates per layer.
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
+        ggml_cuda_op_mul_add_sigmoid_scale(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+        return 4;
+    }
+
     return 0;
 }
 
@@ -5575,7 +5653,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled() && !g_cuda_outer_capture) {
+    if (graph->is_enabled() && !g_cuda_outer_capture && !cuda_ctx->graphs_owner_disabled) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -6877,6 +6955,17 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Turn this backend's own graph cache off for good.
+// An owner that records and replays a whole token per lane calls it, because the per-subgraph captures underneath cover the same kernels and never amortize.
+static void ggml_backend_cuda_graph_cache_disable(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->graphs_owner_disabled = true;
+#else
+    GGML_UNUSED(backend);
+#endif
+}
+
 // Begin recording every kernel this thread issues on `backend`'s stream.
 // ThreadLocal mode so the N lanes can capture their own streams concurrently.
 static bool ggml_backend_cuda_token_capture_begin(ggml_backend_t backend) {
@@ -6938,6 +7027,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_launch_rank") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_launch_rank;
+    }
+    if (strcmp(name, "ggml_backend_graph_cache_disable") == 0) {
+        return (void *) ggml_backend_cuda_graph_cache_disable;
     }
     if (strcmp(name, "ggml_backend_token_capture_begin") == 0) {
         return (void *)ggml_backend_cuda_token_capture_begin;
@@ -7082,6 +7174,16 @@ static ggml_backend_t ggml_backend_cuda_init_impl(int device, bool copy_only) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+    // The BLAS handle and its library state take device memory on first use, which is after the compute buffers were sized.
+    // Creating it here lets the reserve see that memory, so a layout that leaves no room for it fails at reserve instead of at the first prompt.
+    static const bool eager_blas_handle = [] {
+        const char * s = getenv("GGML_CUDA_EAGER_BLAS_HANDLE");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    if (eager_blas_handle && !copy_only) {
+        ctx->cublas_handle();
+    }
 
     return cuda_backend;
 }
