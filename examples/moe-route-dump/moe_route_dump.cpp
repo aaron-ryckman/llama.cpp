@@ -6,6 +6,11 @@
 // n_batch chunks. The tool reads graph tensors through the eval callback, so it needs no llama.cpp source change; the
 // scheduler cuts the graph after every observed tensor (no fusion across those cuts, e.g. the fused top-k MoE kernel).
 //
+// Escapes: common_params_parse runs string_process_escapes() on the whole prompt first (params.escape defaults to true
+// here), so literal \n, \r, \t, \', \", \\ and \xNN in the input become the characters they name; the server does not
+// do this. --no-escape tokenizes the text exactly as the server does. llama-perplexity defaults to no escapes:
+// --parse-special --escape reproduces this tool's default tokenization there.
+//
 // Environment:
 //   ROUTE_DUMP_OUT          path of the ids stream (required)
 //   ROUTE_DUMP_STREAMS      sidecar streams to write next to it, comma separated: weights,probs,norms,bias
