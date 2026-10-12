@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -422,6 +423,103 @@ static void llama_ple_prefault(const ggml_tensor * tab) {
     }
     LLAMA_LOG_WARN("%s: LLAMA_PLE_PREFAULT=1, touched %zu MiB of %s in %.1f s (%d threads)\n", __func__,
                    nbytes / (1024 * 1024), tab->name, (ggml_time_us() - t0) / 1e6, n_threads);
+}
+
+// Router keep-mask, opt in with LLAMA_MOE_DROP_MASK=<file>: an expert-pruning quality experiment without touching the model file.
+// One line per layer, `<layer> <expert> <expert> ...`, listing the experts that layer's router may no longer pick; '#' starts a comment.
+// exp_probs_b only enters top-k selection (build_moe_ffn and the fused topk-moe kernel both take the mixing weights from the
+// unbiased probs), so setting a dropped expert's bias far below every real one removes it from selection and nothing else.
+static void llama_moe_drop_mask_apply(const std::vector<llama_layer> & layers, const llama_hparams & hparams, const llama_mmaps & mappings) {
+    const char * path = getenv("LLAMA_MOE_DROP_MASK");
+    if (path == nullptr) {
+        return;
+    }
+    // Finite in f16 too, and twice it as well, so no cast or pairwise sum can reach inf; real biases are O(10) and the sqrt-softplus probs are >= 0.
+    const float drop_bias = -1.0e4f;
+    const int64_t n_expert = hparams.n_expert;
+
+    std::ifstream file(path);
+    if (!file) {
+        throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: cannot read '%s'", path));
+    }
+    auto parse_id = [&](const std::string & tok, int64_t n, const char * what, int line_no) {
+        char * end = nullptr;
+        const long long v = strtoll(tok.c_str(), &end, 10);
+        if (tok.empty() || *end != '\0' || v < 0 || v >= n) {
+            throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: %s:%d: %s '%s' is not in [0, %lld)", path, line_no, what, tok.c_str(), (long long) n));
+        }
+        return (int64_t) v;
+    };
+
+    std::map<int64_t, std::vector<int64_t>> drops;
+    std::string line;
+    for (int line_no = 1; std::getline(file, line); ++line_no) {
+        line = line.substr(0, line.find('#'));
+        std::istringstream ss(line);
+        std::string tok;
+        if (!(ss >> tok)) {
+            continue;
+        }
+        const int64_t il = parse_id(tok, (int64_t) layers.size(), "layer id", line_no);
+        if (drops.count(il)) {
+            throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: %s:%d: layer %lld listed twice", path, line_no, (long long) il));
+        }
+        std::vector<bool> seen(n_expert, false);
+        auto & ids = drops[il];
+        while (ss >> tok) {
+            const int64_t e = parse_id(tok, n_expert, "expert id", line_no);
+            if (seen[e]) {
+                throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: %s:%d: expert %lld listed twice", path, line_no, (long long) e));
+            }
+            seen[e] = true;
+            ids.push_back(e);
+        }
+        if (n_expert - (int64_t) ids.size() < (int64_t) hparams.n_expert_used) {
+            throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: %s:%d: layer %lld keeps %lld experts, fewer than top-k %u",
+                path, line_no, (long long) il, (long long) (n_expert - (int64_t) ids.size()), hparams.n_expert_used));
+        }
+    }
+    if (drops.empty()) {
+        throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: '%s' lists no layers", path));
+    }
+
+    // check every listed layer before writing any of them
+    for (const auto & [il, ids] : drops) {
+        const ggml_tensor * b = layers[il].ffn_exp_probs_b;
+        if (b == nullptr) {
+            throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: layer %lld has no ffn_exp_probs_b", (long long) il));
+        }
+        if (b->type != GGML_TYPE_F32 || ggml_nelements(b) != n_expert) {
+            throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: %s is %s with %lld elements, expected F32 with %lld",
+                b->name, ggml_type_name(b->type), (long long) ggml_nelements(b), (long long) n_expert));
+        }
+        if (b->buffer == nullptr || b->data == nullptr) {
+            throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: %s has no buffer", b->name));
+        }
+        // a buffer made from the file mapping is read-only memory
+        for (const auto & m : mappings) {
+            const char * lo = m ? (const char *) m->addr() : nullptr;
+            if (lo != nullptr && (const char *) b->data >= lo && (const char *) b->data < lo + m->size()) {
+                throw std::runtime_error(format("LLAMA_MOE_DROP_MASK: %s sits in the read-only model file mapping; load without mmap (e.g. -lm dio) or keep it on a device", b->name));
+            }
+        }
+    }
+
+    size_t n_min = SIZE_MAX, n_max = 0, n_sum = 0;
+    std::vector<float> bias(n_expert);
+    for (const auto & [il, ids] : drops) {
+        ggml_tensor * b = layers[il].ffn_exp_probs_b;
+        ggml_backend_tensor_get(b, bias.data(), 0, ggml_nbytes(b));
+        for (const int64_t e : ids) {
+            bias[e] = drop_bias;
+        }
+        ggml_backend_tensor_set(b, bias.data(), 0, ggml_nbytes(b));
+        n_min  = std::min(n_min, ids.size());
+        n_max  = std::max(n_max, ids.size());
+        n_sum += ids.size();
+    }
+    LLAMA_LOG_WARN("keep-mask: %s: %zu layers, dropped min/mean/max per layer %zu/%.1f/%zu (exp_probs_b of dropped experts = %.0f)\n",
+        path, drops.size(), n_min, (double) n_sum / drops.size(), n_max, drop_bias);
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -2296,6 +2394,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    llama_moe_drop_mask_apply(layers, hparams, pimpl->mappings);
 
     llama_ple_prefault(per_layer_tok_embd);
 
